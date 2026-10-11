@@ -3,14 +3,55 @@
 AVR Control switches an Onkyo AV receiver and your monitors' inputs from global
 hotkeys. It runs in the system tray on Linux (Wayland and X11) and Windows.
 
-- **Receiver**: controlled over the network with Onkyo's eISCP protocol. It can
-  power on and off, select inputs, change volume and mute, toggle HDMI audio
-  out, and send any raw eISCP command.
-- **Monitors**: inputs are switched over DDC/CI (VCP feature `0x60`). This uses
-  `ddcutil` on Linux and the Monitor Configuration API on Windows.
-- **Shortcuts**: each shortcut can switch the receiver, any number of monitors,
-  or both. You can also run a shortcut from the tray menu or with
-  `avrcontrol trigger <id>`.
+
+## Features
+
+### Shortcuts
+- Global hotkeys that switch the **receiver input**, **any number of
+  monitors**, or both in one press. A switch shortcut can also power the
+  receiver on, pick the HDMI output, set a listening mode and set the volume.
+- Built-in actions: power on/off/toggle, volume up/down, mute, HDMI audio
+  out, listening mode (pick one or step through), HDMI output, set volume.
+- A **Receiver setting** action for everything else the receiver supports:
+  mute on/off, 1 dB volume steps, A/V sync, subwoofer and centre level,
+  AccuEQ, Music Optimizer, Phase Matching Bass, late night, audio selector,
+  display dimmer, sleep timer, HDMI CEC, 12 V triggers, tuner presets,
+  network/USB playback, the receiver's on-screen menu, and zone 2/3 power,
+  volume, mute and input.
+- Holding a volume, level, tuner or menu-arrow key repeats it.
+- Shortcuts are also in the tray menu and on the command line
+  (`avrcontrol trigger <id>`).
+
+### Receiver
+- Finds the receiver on the network, reads its model and the inputs it
+  actually has (with the receiver's own names).
+- Knows exactly which commands and values each model supports, from Onkyo's
+  protocol spreadsheet (252 models). Other models are probed on first
+  connection.
+- Control panel for testing every supported function without a shortcut.
+- Works with receivers that allow only one network client: the settings
+  window and command line share the background service's connection.
+
+### Monitors
+- Lists monitors that support DDC/CI input switching, with their current
+  input and the inputs they advertise; one click switches input.
+- On KDE Plasma also shows resolution, refresh rate, scale, position,
+  rotation, colour depth, HDR, wide colour gamut, adaptive sync and screen
+  size, plus brightness and contrast over DDC/CI.
+
+### Status
+- A Status page with live receiver state (power, input, volume, listening
+  mode, HDMI output), the incoming video and audio signal, zones, and every
+  monitor.
+- The tray tooltip shows the same at a glance.
+- Volume changes show Plasma's own volume OSD on KDE, or a small overlay
+  elsewhere. Actions show desktop notifications.
+
+### Desktop integration
+- Linux: Wayland and X11. Hotkeys go through the XDG Global Shortcuts portal
+  (KDE Plasma, GNOME 48+); the tray uses StatusNotifierItem.
+- Windows: tray icon and `RegisterHotKey` hotkeys.
+- Start on login, a systemd user unit, and an Arch package (PKGBUILD).
 
 ## Settings window
 
