@@ -71,14 +71,16 @@ jobs:
         shell: bash
         run: |
           set -eu
-          pacman -Syu --noconfirm --needed rust
-          cd packaging/arch
-          source ./PKGBUILD
-          pacman -S --noconfirm --needed "${depends[@]}"
-          # makepkg refuses to run as root.
+          # rust explicitly: makepkg -s would otherwise be free to satisfy
+          # "cargo" with rustup, which has no toolchain installed.
+          pacman -Syu --noconfirm --needed sudo rust
+          # makepkg refuses to run as root; let its user install the
+          # PKGBUILD's dependencies (makepkg -s) through sudo.
           useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
           chown -R builder "$GITHUB_WORKSPACE"
-          su - builder -c "cd '$PWD' && makepkg -f --noconfirm"
+          cd packaging/arch
+          su - builder -c "cd '$PWD' && makepkg -sf --noconfirm"
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp ./*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
       - uses: actions/upload-artifact@v4
