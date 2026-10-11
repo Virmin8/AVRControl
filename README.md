@@ -82,9 +82,28 @@ avrcontrol discover        search the network for receivers
 avrcontrol reload | quit   control the running instance
 ```
 
+## Download
+
+Every [release](https://github.com/Virmin8/AVRControl/releases) has:
+
+| File | For |
+| --- | --- |
+| `avrcontrol-<version>-setup.exe` | Windows installer |
+| `avrcontrol-<version>-windows-x64.exe` | Windows, portable: run it from anywhere |
+| `avrcontrol-<version>-1-x86_64.pkg.tar.zst` | Arch Linux and derivatives |
+| `avrcontrol-<version>-x86_64.AppImage` | Other Linux distributions |
+
 ## Linux
 
 ### Install (Arch / pacman)
+
+Install the release package:
+
+```sh
+sudo pacman -U avrcontrol-<version>-1-x86_64.pkg.tar.zst
+```
+
+Or build it from source:
 
 ```sh
 git clone https://github.com/Virmin8/AVRControl.git
@@ -98,6 +117,18 @@ on login, turn on **Start on login** in Settings → General, or run
 
 To build without packaging, run `cargo build --release`. You also need
 `ddcutil` installed and the `i2c-dev` kernel module loaded.
+
+### AppImage
+
+```sh
+chmod +x avrcontrol-<version>-x86_64.AppImage
+./avrcontrol-<version>-x86_64.AppImage
+```
+
+The AppImage doesn't include `ddcutil`, so install it from your distribution
+for monitor switching, and load `i2c-dev` (`sudo modprobe i2c-dev`). It also
+doesn't install a `.desktop` file, so under Wayland its shortcuts may show
+up under an unnamed entry in your desktop's shortcut settings (see below).
 
 ### Global hotkeys on Wayland
 
@@ -124,14 +155,35 @@ DDC/CI also has to be turned on in each monitor's on-screen menu.
 
 ## Windows
 
+The installer sets AVR Control up for your user only (no admin prompt) in
+`%LOCALAPPDATA%\Programs\AVR Control`, with a Start menu entry and an
+uninstaller under Settings → Apps. It can also turn on starting at sign-in.
+The portable `.exe` needs no installing; run it from wherever you keep it.
+
+Building needs Rust (via [rustup](https://rustup.rs)) and the Visual Studio
+Build Tools with the "Desktop development with C++" workload.
+
 ```powershell
 cargo build --release
 # target\release\avrcontrol.exe
+
+# Installer (needs Inno Setup 6)
+iscc /DAppVersion=1.0.0 packaging\windows\avrcontrol.iss
+# target\installer\avrcontrol-1.0.0-setup.exe
 ```
+
+Run `avrcontrol.exe` to start it in the tray. Left-click the tray icon to open
+Settings, right-click for the menu.
 
 Hotkeys use `RegisterHotKey`. If another program already uses a hotkey, AVR
 Control shows a notification. Start on login adds an entry under
-`HKCU\...\CurrentVersion\Run`.
+`HKCU\...\CurrentVersion\Run`. Monitors are switched through the Windows
+monitor configuration API, so no extra software is needed, but DDC/CI still
+has to be turned on in each monitor's on-screen menu.
+
+`avrcontrol.exe` is a GUI program, so cmd and PowerShell don't wait for it
+and command-line output can appear after the prompt. Pipe it to see it in
+order, e.g. `avrcontrol list | more`.
 
 ## Volume indicator
 

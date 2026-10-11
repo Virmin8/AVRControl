@@ -1,0 +1,102 @@
+name: release
+
+# Pushing a tag like v1.0.0 builds every package and publishes a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Installer and portable exe
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version /DOutputDir=..\..\dist packaging\windows\avrcontrol.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target\release\avrcontrol.exe "dist\avrcontrol-$version-windows-x64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  appimage:
+    # The oldest supported runner, so the AppImage runs on older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml $version"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: AppImage
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          appid=io.github.virmin8.AVRControl
+          install -Dm755 target/release/avrcontrol AppDir/usr/bin/avrcontrol
+          install -Dm644 packaging/linux/$appid.desktop AppDir/usr/share/applications/$appid.desktop
+          install -Dm644 assets/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/$appid.png
+          cp packaging/linux/$appid.desktop AppDir/
+          cp assets/icon.png AppDir/$appid.png
+          ln -s usr/bin/avrcontrol AppDir/AppRun
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          mkdir -p dist
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool AppDir dist/avrcontrol-$version-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: dist/*
+
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - name: makepkg
+        shell: bash
+        run: |
+          set -eu
+          pacman -Syu --noconfirm --needed rust
+          cd packaging/arch
+          source ./PKGBUILD
+          pacman -S --noconfirm --needed "${depends[@]}"
+          # makepkg refuses to run as root.
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su - builder -c "cd '$PWD' && makepkg -f --noconfirm"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp ./*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*
+
+  release:
+    needs: [windows, appimage, arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

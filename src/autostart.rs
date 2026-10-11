@@ -4,6 +4,12 @@
 use anyhow::Result;
 
 fn exe() -> Result<String> {
+    // Inside an AppImage the binary runs from a temporary mount; the
+    // runtime sets $APPIMAGE to the file the user actually launched.
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = std::env::var_os("APPIMAGE") {
+        return Ok(appimage.to_string_lossy().into_owned());
+    }
     Ok(std::env::current_exe()?.to_string_lossy().into_owned())
 }
 
