@@ -1,0 +1,173 @@
+//! Windows: tray icon + RegisterHotKey-based global hotkeys, both serviced
+//! by a Win32 message loop on the main thread.
+
+use std::collections::HashMap;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Result, bail};
+use global_hotkey::hotkey::HotKey;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIconBuilder};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+use crate::config::{APP_NAME, Config};
+use crate::controller::{Event, Hooks};
+
+const WM_APP_RELOAD: u32 = WM_APP + 1;
+const WM_APP_QUIT: u32 = WM_APP + 2;
+const WM_APP_STATUS: u32 = WM_APP + 3;
+
+const MENU_SETTINGS: &str = "__settings";
+const MENU_RECONNECT: &str = "__reconnect";
+const MENU_QUIT: &str = "__quit";
+
+pub fn configure_shortcuts() -> Result<()> {
+    bail!("hotkeys are configured in AVR Control's settings on Windows")
+}
+
+fn build_menu(cfg: &Config) -> Menu {
+    let menu = Menu::new();
+    for s in &cfg.shortcuts {
+        let _ = menu.append(&MenuItem::with_id(s.id.as_str(), &s.name, true, None));
+    }
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&MenuItem::with_id(MENU_SETTINGS, "Settings…", true, None));
+    let _ = menu.append(&MenuItem::with_id(MENU_RECONNECT, "Reconnect", true, None));
+    let _ = menu.append(&MenuItem::with_id(MENU_QUIT, "Quit", true, None));
+    menu
+}
+
+/// Registers every shortcut's hotkey, returning hotkey id -> (shortcut id, repeatable).
+fn register(
+    manager: &GlobalHotKeyManager,
+    cfg: &Config,
+) -> (Vec<HotKey>, HashMap<u32, (String, bool)>) {
+    let mut registered = Vec::new();
+    let mut map = HashMap::new();
+    let mut failed = Vec::new();
+    for s in &cfg.shortcuts {
+        if s.hotkey.trim().is_empty() {
+            continue;
+        }
+        match s.hotkey.parse::<HotKey>() {
+            Ok(hk) => match manager.register(hk) {
+                Ok(()) => {
+                    map.insert(hk.id(), (s.id.clone(), s.action.repeatable()));
+                    registered.push(hk);
+                }
+                Err(_) => failed.push(s.hotkey.clone()),
+            },
+            Err(_) => failed.push(s.hotkey.clone()),
+        }
+    }
+    if !failed.is_empty() {
+        let _ = notify_rust::Notification::new()
+            .summary(APP_NAME)
+            .body(&format!(
+                "Could not register hotkeys (in use by another app?): {}",
+                failed.join(", ")
+            ))
+            .show();
+    }
+    (registered, map)
+}
+
+pub fn run(
+    cfg: Config,
+    tx: Sender<Event>,
+    start: impl FnOnce(Config, Hooks) + Send + 'static,
+) -> Result<()> {
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let pending: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
+    let pending_status: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let img = crate::icon_rgba();
+    let icon = Icon::from_rgba(img.data.clone(), img.width, img.height)?;
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(build_menu(&cfg)))
+        .with_icon(icon)
+        .with_tooltip(APP_NAME)
+        .build()?;
+
+    let menu_tx = tx.clone();
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        let event = match e.id.0.as_str() {
+            MENU_SETTINGS => {
+                crate::daemon::open_settings();
+                return;
+            }
+            MENU_RECONNECT => Event::Reconnect,
+            MENU_QUIT => Event::Quit,
+            id => Event::Trigger(id.to_string()),
+        };
+        let _ = menu_tx.send(event);
+    }));
+
+    let manager = GlobalHotKeyManager::new()?;
+    let (mut registered, map) = register(&manager, &cfg);
+    let map = Arc::new(Mutex::new(map));
+    let hk_map = map.clone();
+    let hk_tx = tx.clone();
+    GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| match e.state {
+        HotKeyState::Pressed => {
+            if let Some((id, repeatable)) = hk_map.lock().unwrap().get(&e.id) {
+                crate::repeat::pressed(&hk_tx, id, *repeatable);
+            }
+        }
+        HotKeyState::Released => crate::repeat::released(),
+    }));
+
+    let reload_pending = pending.clone();
+    let status_pending = pending_status.clone();
+    start(
+        cfg,
+        Hooks {
+            on_reload: Box::new(move |c| {
+                *reload_pending.lock().unwrap() = Some(c.clone());
+                unsafe { PostThreadMessageW(thread_id, WM_APP_RELOAD, 0, 0) };
+            }),
+            on_quit: Box::new(move || unsafe {
+                PostThreadMessageW(thread_id, WM_APP_QUIT, 0, 0);
+            }),
+            on_status: std::sync::Arc::new(move |text| {
+                *status_pending.lock().unwrap() = Some(text);
+                unsafe { PostThreadMessageW(thread_id, WM_APP_STATUS, 0, 0) };
+            }),
+        },
+    );
+
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            if msg.hwnd.is_null() && msg.message == WM_APP_QUIT {
+                break;
+            }
+            if msg.hwnd.is_null() && msg.message == WM_APP_STATUS {
+                if let Some(text) = pending_status.lock().unwrap().take() {
+                    // Windows tray tooltips are limited to 127 characters.
+                    let tip: String = format!("{APP_NAME}\n{text}").chars().take(127).collect();
+                    let _ = tray.set_tooltip(Some(tip));
+                }
+                continue;
+            }
+            if msg.hwnd.is_null() && msg.message == WM_APP_RELOAD {
+                if let Some(cfg) = pending.lock().unwrap().take() {
+                    let _ = manager.unregister_all(&registered);
+                    let (r, m) = register(&manager, &cfg);
+                    registered = r;
+                    *map.lock().unwrap() = m;
+                    tray.set_menu(Some(Box::new(build_menu(&cfg))));
+                }
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    let _ = manager.unregister_all(&registered);
+    drop(tray);
+    Ok(())
+}

@@ -1,0 +1,67 @@
+# Maintainer: Virmin8
+#
+# Builds the working tree this file lives in (rust/packaging/arch), so
+# `makepkg -si` here installs whatever is checked out locally.
+
+pkgname=avrcontrol
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Control an Onkyo AV receiver and monitor inputs (DDC/CI) with global shortcuts"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Virmin8/AVRControl"
+license=('MIT')
+depends=(
+  'ddcutil'
+  'gcc-libs'
+  'glibc'
+  'libglvnd'
+  'libxkbcommon'
+  'wayland'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxrandr'
+)
+makedepends=('cargo')
+optdepends=(
+  'xdg-desktop-portal-kde: global shortcuts on KDE Plasma'
+  'xdg-desktop-portal-gnome: global shortcuts on GNOME 48+'
+)
+install=avrcontrol.install
+options=('!lto' '!debug')
+
+_srcroot="$startdir/../.."
+_appid=io.github.virmin8.AVRControl
+
+prepare() {
+  cd "$_srcroot"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_srcroot"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$srcdir=/build"
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$_srcroot"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$_srcroot"
+  install -Dm755 "$srcdir/target/release/avrcontrol" "$pkgdir/usr/bin/avrcontrol"
+  install -Dm644 "packaging/linux/$_appid.desktop" "$pkgdir/usr/share/applications/$_appid.desktop"
+  install -Dm644 assets/icon.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/$_appid.png"
+  install -Dm644 assets/icon-64.png "$pkgdir/usr/share/icons/hicolor/64x64/apps/$_appid.png"
+  install -Dm644 packaging/linux/avrcontrol.service "$pkgdir/usr/lib/systemd/user/avrcontrol.service"
+  install -Dm644 packaging/linux/avrcontrol-i2c.conf "$pkgdir/usr/lib/modules-load.d/avrcontrol-i2c.conf"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

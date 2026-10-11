@@ -1,0 +1,13 @@
+[Unit]
+Description=AVR Control (Onkyo receiver and monitor input hotkeys)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/avrcontrol daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,13 @@
+post_install() {
+  modprobe i2c-dev 2>/dev/null || true
+  echo ">> Start \"AVR Control\" from the application menu (or run: avrcontrol)."
+  echo ">> Enable \"Start on login\" under Settings > General, or:"
+  echo ">>   systemctl --user enable --now avrcontrol.service"
+  echo ">> Monitor input switching needs access to /dev/i2c-* (ddcutil's udev"
+  echo ">> rule grants it to the logged-in user; otherwise join the i2c group)."
+}
+
+post_upgrade() {
+  modprobe i2c-dev 2>/dev/null || true
+  echo ">> Restart AVR Control to use the new version: avrcontrol quit && avrcontrol"
+}

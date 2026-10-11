@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AVR Control
+GenericName=Receiver and monitor input control
+Comment=Switch an Onkyo AV receiver and monitor inputs with global shortcuts
+Exec=avrcontrol
+Icon=io.github.virmin8.AVRControl
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=onkyo;receiver;avr;amplifier;monitor;ddc;input;hdmi;
+StartupNotify=false
