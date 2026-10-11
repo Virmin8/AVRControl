@@ -958,8 +958,16 @@ fn query_ecn(targets: &[SocketAddr], wait: Duration) -> Result<Vec<DiscoveredRec
         let (n, from) = match sock.recv_from(&mut buf) {
             Ok(r) => r,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
-            // ICMP port-unreachable from a swept host surfaces as this on Linux.
-            Err(e) if e.kind() == ErrorKind::ConnectionRefused => continue,
+            // ICMP port-unreachable from a swept host surfaces as
+            // ConnectionRefused on Linux and ConnectionReset on Windows.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                ) =>
+            {
+                continue;
+            }
             Err(e) => return Err(e.into()),
         };
         let mut data = buf[..n].to_vec();

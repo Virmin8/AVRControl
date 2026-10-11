@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -52,7 +52,10 @@ fn register(
         if s.hotkey.trim().is_empty() {
             continue;
         }
-        match s.hotkey.parse::<HotKey>() {
+        // Normalise first: our parser accepts aliases (Win, Meta, PgUp, ...)
+        // that global-hotkey doesn't.
+        let canonical = crate::hotkey::Hotkey::parse(&s.hotkey).map(|h| h.to_string());
+        match canonical.as_deref().unwrap_or(&s.hotkey).parse::<HotKey>() {
             Ok(hk) => match manager.register(hk) {
                 Ok(()) => {
                     map.insert(hk.id(), (s.id.clone(), s.action.repeatable()));
@@ -90,7 +93,20 @@ pub fn run(
         .with_menu(Box::new(build_menu(&cfg)))
         .with_icon(icon)
         .with_tooltip(APP_NAME)
+        // Left click opens settings like on Linux; the menu is on right click.
+        .with_menu_on_left_click(false)
         .build()?;
+
+    TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = e
+        {
+            crate::daemon::open_settings();
+        }
+    }));
 
     let menu_tx = tx.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {

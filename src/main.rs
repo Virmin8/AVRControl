@@ -143,6 +143,9 @@ fn run(args: &[String]) -> Result<()> {
                     .map(|&c| format!("{} (0x{c:02x})", monitors::input_name(c)))
                     .collect();
                 println!("    current input: {current}");
+                if let Some(s) = m.signal {
+                    println!("    signal: {}", s.describe());
+                }
                 println!("    inputs: {}", inputs.join(", "));
                 if let Some(e) = m.error {
                     println!("    error: {e}");

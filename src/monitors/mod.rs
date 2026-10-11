@@ -27,6 +27,8 @@ pub struct MonitorInfo {
     pub inputs: Vec<u8>,
     /// What the desktop is driving it with (resolution, refresh, ...).
     pub mode: Option<DisplayMode>,
+    /// The signal on the input it's showing, as the monitor reports it.
+    pub signal: Option<Signal>,
     /// (current, max) of VCP 0x10 / 0x12.
     pub brightness: Option<(u16, u16)>,
     pub contrast: Option<(u16, u16)>,
@@ -75,6 +77,53 @@ impl DisplayMode {
     }
 }
 
+/// Timing of the signal a monitor is showing, from VCP 0xAC (horizontal
+/// frequency) and 0xAE (vertical frequency). Unlike `DisplayMode`, which is
+/// what this PC sends, it follows the monitor's current input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Signal {
+    pub h_freq_hz: u32,
+    pub v_freq_hz: f32,
+}
+
+/// Visible line counts of common modes, for guessing the resolution.
+const COMMON_HEIGHTS: [u32; 9] = [2160, 1600, 1440, 1200, 1080, 1024, 768, 720, 480];
+
+impl Signal {
+    /// From the raw (current, max) words of VCP 0xAC and 0xAE.
+    pub fn from_vcp(ac: (u16, u16), ae: (u16, u16)) -> Option<Signal> {
+        // 0xAC is 24 bits in Hz: the high byte comes back as "max". 0xAE is
+        // in 0.01 Hz. 0 means no signal, FFFF that the monitor can't tell.
+        let h_freq_hz = (((ac.1 & 0xff) as u32) << 16) | ac.0 as u32;
+        if h_freq_hz == 0 || ae.0 == 0 || ae.0 == 0xffff {
+            return None;
+        }
+        Some(Signal {
+            h_freq_hz,
+            v_freq_hz: ae.0 as f32 / 100.0,
+        })
+    }
+
+    /// Visible lines per frame, guessed from the total: a frame carries a
+    /// few percent of blanking lines on top of the visible ones. Monitors
+    /// don't report the resolution itself.
+    pub fn lines(&self) -> Option<u32> {
+        let total = self.h_freq_hz as f32 / self.v_freq_hz;
+        COMMON_HEIGHTS
+            .into_iter()
+            .find(|&h| (1.0..=1.10).contains(&(total / h as f32)))
+    }
+
+    /// e.g. "1440p · 163.90 Hz"
+    pub fn describe(&self) -> String {
+        let hz = format!("{:.2} Hz", self.v_freq_hz).replace(".00 Hz", " Hz");
+        match self.lines() {
+            Some(lines) => format!("{lines}p · {hz}"),
+            None => hz,
+        }
+    }
+}
+
 /// Lists all connected displays. With `details`, also reads every monitor's
 /// current input and supported inputs, which takes a second or two each.
 pub fn scan(details: bool) -> anyhow::Result<Vec<MonitorInfo>> {
@@ -88,6 +137,20 @@ pub fn scan(details: bool) -> anyhow::Result<Vec<MonitorInfo>> {
         }
     }
     Ok(list)
+}
+
+/// Monitors don't answer DDC/CI for a few seconds while switching input, so a
+/// scan in that window would wrongly mark them as not supporting it. Keeps
+/// what an earlier scan learned about such a monitor instead.
+pub fn carry_over(list: &mut [MonitorInfo], previous: &[MonitorInfo]) {
+    for m in list.iter_mut().filter(|m| !m.ddc) {
+        if let Some(prev) = previous.iter().find(|p| p.ddc && p.id == m.id) {
+            m.ddc = true;
+            if m.inputs.is_empty() {
+                m.inputs = prev.inputs.clone();
+            }
+        }
+    }
 }
 
 /// (monitor, connector, current input) for each DDC/CI monitor.
@@ -148,5 +211,31 @@ pub fn selectable_inputs(info: Option<&MonitorInfo>) -> Vec<u8> {
     match info {
         Some(m) if !m.inputs.is_empty() => m.inputs.clone(),
         _ => vec![0x0f, 0x10, 0x11, 0x12, 0x03, 0x01, 0x1b],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_from_vcp() {
+        // Read from a Dell S3220DGF (1440p @ 163.9 Hz) and S2721HN (1080p @ 75 Hz).
+        let s = Signal::from_vcp((47192, 3), (16390, 65535)).unwrap();
+        assert_eq!(s.h_freq_hz, 243_800);
+        assert_eq!(s.describe(), "1440p · 163.90 Hz");
+        let s = Signal::from_vcp((18364, 1), (7500, 65535)).unwrap();
+        assert_eq!(s.describe(), "1080p · 75 Hz");
+        // 4K60 (CTA timing, 2250 lines) and 720p60 (750 lines).
+        assert_eq!(
+            Signal::from_vcp((3928, 2), (6000, 0)).unwrap().lines(),
+            Some(2160)
+        );
+        assert_eq!(
+            Signal::from_vcp((45000, 0), (6000, 0)).unwrap().lines(),
+            Some(720)
+        );
+        assert_eq!(Signal::from_vcp((0, 0), (0, 0)), None);
+        assert_eq!(Signal::from_vcp((18364, 1), (0xffff, 0xffff)), None);
     }
 }

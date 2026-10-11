@@ -224,17 +224,18 @@ fn monitor_card(ui: &mut egui::Ui, m: &MonitorInfo) {
                     .map(monitors::input_name)
                     .unwrap_or_else(|| "No answer".into()),
             );
+            theme::kv(ui, "Input signal", signal_text(m));
             if has_mode && !d.enabled {
-                theme::kv_colored(ui, "Output", "Disabled", theme::TEXT_MUTED);
+                theme::kv_colored(ui, "PC output", "Disabled", theme::TEXT_MUTED);
             }
             theme::kv(
                 ui,
-                "Resolution",
+                "PC resolution",
                 if has_mode { d.resolution() } else { dash() },
             );
             theme::kv(
                 ui,
-                "Refresh rate",
+                "PC refresh rate",
                 if has_mode { d.refresh() } else { dash() },
             );
             theme::kv(
@@ -287,6 +288,12 @@ fn monitor_card(ui: &mut egui::Ui, m: &MonitorInfo) {
             }
         },
     );
+}
+
+/// What the monitor says it's receiving on its current input. "–" covers
+/// both no signal and monitors that don't report it.
+fn signal_text(m: &MonitorInfo) -> String {
+    m.signal.map(|s| s.describe()).unwrap_or_else(|| "–".into())
 }
 
 fn err_color(ui: &egui::Ui) -> Color32 {
@@ -1690,8 +1697,9 @@ impl SettingsApp {
                                         .map(monitors::input_name)
                                         .unwrap_or_else(|| "No answer".into()),
                                 );
+                                theme::kv(ui, "Input signal", signal_text(m));
                                 if let Some(d) = &m.mode {
-                                    theme::kv(ui, "Mode", format!("{} @ {}", d.resolution(), d.refresh()));
+                                    theme::kv(ui, "PC output", format!("{} @ {}", d.resolution(), d.refresh()));
                                 }
                                 ui.add_space(6.0);
                                 ui.label(RichText::new("Switch to").color(theme::TEXT_SECONDARY));
@@ -1905,6 +1913,7 @@ impl SettingsApp {
         let dirty = self.dirty();
         let daemon_running = self.daemon_running;
         let mut run_now = false;
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut configure_portal = false;
 
         let s = &mut self.cfg.shortcuts[self.selected];
@@ -2408,7 +2417,14 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.monitors.poll();
+        if self.monitors.running() {
+            let previous = self.monitors.ok().cloned().unwrap_or_default();
+            if self.monitors.poll()
+                && let Some(Ok(list)) = &mut self.monitors.result
+            {
+                monitors::carry_over(list, &previous);
+            }
+        }
         self.receiver.poll();
         self.discovery.poll();
         self.monitor_test.poll();

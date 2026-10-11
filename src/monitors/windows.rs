@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 use std::ptr;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use windows_sys::Win32::Devices::Display::*;
@@ -224,11 +226,29 @@ fn physicals() -> Physicals {
     Physicals(raw, out)
 }
 
+/// Reads a VCP feature as (current, max). Monitors now and then miss a
+/// request, so a failed read is retried once.
+fn read_vcp(handle: HANDLE, code: u8) -> Option<(u32, u32)> {
+    for attempt in 0..2 {
+        if attempt > 0 {
+            sleep(Duration::from_millis(100));
+        }
+        let (mut kind, mut cur, mut max) = (0, 0u32, 0u32);
+        let ok =
+            unsafe { GetVCPFeatureAndVCPFeatureReply(handle, code, &mut kind, &mut cur, &mut max) };
+        if ok != 0 {
+            return Some((cur, max));
+        }
+    }
+    None
+}
+
 fn vcp_continuous(handle: HANDLE, code: u8) -> Option<(u16, u16)> {
-    let (mut kind, mut cur, mut max) = (0, 0u32, 0u32);
-    let ok =
-        unsafe { GetVCPFeatureAndVCPFeatureReply(handle, code, &mut kind, &mut cur, &mut max) };
-    (ok != 0).then_some((cur as u16, max as u16))
+    read_vcp(handle, code).map(|(cur, max)| (cur as u16, max as u16))
+}
+
+fn signal(handle: HANDLE) -> Option<super::Signal> {
+    super::Signal::from_vcp(vcp_continuous(handle, 0xac)?, vcp_continuous(handle, 0xae)?)
 }
 
 /// Modes are filled in by scan() directly on Windows.
@@ -237,10 +257,7 @@ pub fn display_modes() -> HashMap<String, super::DisplayMode> {
 }
 
 fn current_input(handle: HANDLE) -> Option<u8> {
-    let (mut kind, mut cur, mut max) = (0, 0u32, 0u32);
-    let ok =
-        unsafe { GetVCPFeatureAndVCPFeatureReply(handle, 0x60, &mut kind, &mut cur, &mut max) };
-    (ok != 0).then_some((cur & 0xff) as u8)
+    read_vcp(handle, 0x60).map(|(cur, _)| (cur & 0xff) as u8)
 }
 
 /// Extracts the values listed for VCP 60 from an MCCS capabilities string,
@@ -300,6 +317,7 @@ pub fn scan(details: bool) -> Result<Vec<MonitorInfo>> {
                 current_input: current,
                 inputs: inputs.unwrap_or_default(),
                 mode: p.mode.clone(),
+                signal: details.then(|| signal(p.handle)).flatten(),
                 brightness: details.then(|| vcp_continuous(p.handle, 0x10)).flatten(),
                 contrast: details.then(|| vcp_continuous(p.handle, 0x12)).flatten(),
                 error: None,
@@ -318,13 +336,52 @@ pub fn current_inputs() -> Result<Vec<(MonitorId, String, Option<u8>)>> {
         .collect())
 }
 
+/// How long to wait for a monitor to report the new input.
+const SWITCH_TIMEOUT: Duration = Duration::from_secs(8);
+/// A monitor still reporting another input this long after a write has
+/// dropped it.
+const RESEND_AFTER: Duration = Duration::from_millis(1500);
+const MAX_SENDS: u32 = 3;
+
+/// Switches input and waits until the monitor reports it. Monitors stop
+/// answering DDC/CI for a few seconds while they switch, and acknowledge
+/// writes that arrive meanwhile without acting on them, so a single write
+/// isn't enough: read the input back and resend until it sticks.
 pub fn set_input(id: &MonitorId, input: u8) -> Result<()> {
     let phys = physicals();
     let Some(p) = phys.1.iter().find(|p| &p.id == id) else {
         bail!("monitor {} not found", id.label());
     };
-    if unsafe { SetVCPFeature(p.handle, 0x60, input as u32) } == 0 {
-        bail!("monitor {} rejected the input change", id.label());
+    // Monitors that can't report their input can only be switched blind.
+    let verify = current_input(p.handle).is_some();
+    let start = Instant::now();
+    let mut sends = 0;
+    let mut last_send = start;
+    loop {
+        if sends == 0 || last_send.elapsed() >= RESEND_AFTER {
+            if sends == MAX_SENDS {
+                bail!(
+                    "monitor {} ignored the switch to {}",
+                    id.label(),
+                    super::input_name(input)
+                );
+            }
+            if unsafe { SetVCPFeature(p.handle, 0x60, input as u32) } == 0 && !verify {
+                bail!("monitor {} rejected the input change", id.label());
+            }
+            sends += 1;
+            last_send = Instant::now();
+        }
+        if !verify || start.elapsed() > SWITCH_TIMEOUT {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250));
+        match current_input(p.handle) {
+            Some(cur) if cur == input => return Ok(()),
+            // Still on the old input: keep the resend timer running.
+            Some(_) => {}
+            // Busy switching: give it time before deciding to resend.
+            None => last_send = Instant::now(),
+        }
     }
-    Ok(())
 }

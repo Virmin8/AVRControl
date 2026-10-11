@@ -187,10 +187,16 @@ pub fn scan(details: bool) -> Result<Vec<MonitorInfo>> {
                             info.error.get_or_insert(e.to_string());
                         }
                     }
-                    if let Ok(out) = ddcutil(&["--bus", &bus, "getvcp", "10", "12", "--terse"]) {
+                    if let Ok(out) =
+                        ddcutil(&["--bus", &bus, "getvcp", "10", "12", "AC", "AE", "--terse"])
+                    {
                         let values = parse_continuous(&out);
                         info.brightness = values.get(&0x10).copied();
                         info.contrast = values.get(&0x12).copied();
+                        info.signal = values
+                            .get(&0xac)
+                            .zip(values.get(&0xae))
+                            .and_then(|(&ac, &ae)| super::Signal::from_vcp(ac, ae));
                     }
                 }
                 info
