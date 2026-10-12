@@ -50,6 +50,9 @@ pub struct ReceiverConfig {
 pub struct GeneralConfig {
     /// Id of a shortcut to run once when the app starts. Empty = none.
     pub startup_shortcut: String,
+    /// At shutdown, turn the receiver off if it is still on the startup
+    /// shortcut's input (left alone on any other input, e.g. a console).
+    pub shutdown_power_off: bool,
     pub notifications: bool,
     pub volume_osd: bool,
     /// Look for a new release on GitHub (at launch and every 48 hours).
@@ -271,6 +274,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             startup_shortcut: "pc".into(),
+            shutdown_power_off: false,
             notifications: true,
             volume_osd: true,
             check_updates: true,
@@ -443,6 +447,17 @@ impl Config {
     /// command group an action kind needs.
     pub fn supports_kind(&self, kind: &str) -> bool {
         Action::kind_feature(kind).is_none_or(|g| self.supports(g))
+    }
+
+    /// Receiver input the startup shortcut switches to, if it switches one.
+    pub fn startup_input(&self) -> Option<&str> {
+        match &self.shortcut(&self.general.startup_shortcut)?.action {
+            Action::Switch {
+                receiver_input: Some(code),
+                ..
+            } => Some(code),
+            _ => None,
+        }
     }
 
     /// Display name for a receiver input, honouring user labels.

@@ -63,7 +63,7 @@ or running `avrcontrol` while the app is already running.
 | Receiver | IP address (**Find on network** searches for it), connection test, model, power, current input and volume. Also lets you rename or hide receiver inputs. |
 | Monitors | Every connected display with its graphics-card connector (e.g. `DP-1`), its current input, the inputs it supports, and buttons to switch inputs immediately. |
 | Shortcuts | Add, edit and reorder shortcuts. Set the hotkey (type it or press **Record**), then pick a receiver input and a target input for each monitor. |
-| General | Startup action, notifications, volume indicator, start on login, and start/stop of the background service. |
+| General | Startup action, turning the receiver off at shutdown (only if it is still on the startup input), notifications, volume indicator, start on login, and start/stop of the background service. |
 
 The configuration is stored in `~/.config/avrcontrol/config.toml` (Linux) or
 `%APPDATA%\avrcontrol\config\config.toml` (Windows).

@@ -3,13 +3,15 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, bail};
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -25,6 +27,49 @@ const MENU_SETTINGS: &str = "__settings";
 const MENU_RECONNECT: &str = "__reconnect";
 const MENU_QUIT: &str = "__quit";
 const MENU_UPDATE: &str = "__update";
+
+static SHUTDOWN_TX: OnceLock<Sender<Event>> = OnceLock::new();
+
+unsafe extern "system" fn session_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // wParam: the session really is ending. Logging off leaves the receiver alone.
+    if msg == WM_ENDSESSION && wp != 0 && (lp as u32 & ENDSESSION_LOGOFF) == 0 {
+        if let Some(tx) = SHUTDOWN_TX.get() {
+            crate::controller::shutdown(tx);
+        }
+        return 0;
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+/// A hidden top-level window: only those are sent WM_QUERYENDSESSION and
+/// WM_ENDSESSION when Windows shuts down (thread messages and message-only
+/// windows aren't).
+fn create_session_window(tx: Sender<Event>) {
+    let _ = SHUTDOWN_TX.set(tx);
+    let class: Vec<u16> = "AVRControlSession\0".encode_utf16().collect();
+    unsafe {
+        let instance = GetModuleHandleW(std::ptr::null());
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfnWndProc = Some(session_proc);
+        wc.hInstance = instance;
+        wc.lpszClassName = class.as_ptr();
+        RegisterClassW(&wc);
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+    }
+}
 
 pub fn configure_shortcuts() -> Result<()> {
     bail!("hotkeys are configured in AVR Control's settings on Windows")
@@ -131,6 +176,8 @@ pub fn run(
         };
         let _ = menu_tx.send(event);
     }));
+
+    create_session_window(tx.clone());
 
     let manager = GlobalHotKeyManager::new()?;
     let (mut registered, map) = register(&manager, &cfg);

@@ -2,7 +2,7 @@
 //! thread and is driven by `Event`s from hotkeys, the tray and IPC.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver as Rx, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver as Rx, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -16,6 +16,8 @@ use crate::monitors;
 const KEEPALIVE: Duration = Duration::from_secs(30);
 /// Quiet period after an action before the tray status is refreshed.
 const STATUS_DELAY: Duration = Duration::from_millis(700);
+/// How long a system shutdown is held up for the receiver to be turned off.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -23,6 +25,8 @@ pub enum Event {
     Reload,
     Reconnect,
     Quit,
+    /// The computer is shutting down; answered once the receiver is handled.
+    Shutdown(Sender<()>),
     /// A question from the settings window, answered as JSON. Goes through
     /// the controller so only one connection to the receiver is open (some
     /// models drop the older connection when a second client connects).
@@ -32,6 +36,15 @@ pub enum Event {
         port: u16,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+}
+
+/// Tells the controller the computer is shutting down and waits (briefly)
+/// for it to deal with the receiver. Called by the platform layer.
+pub fn shutdown(tx: &Sender<Event>) {
+    let (ack, done) = mpsc::channel();
+    if tx.send(Event::Shutdown(ack)).is_ok() {
+        let _ = done.recv_timeout(SHUTDOWN_WAIT);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +143,10 @@ impl Controller {
                 }
                 Ok(Event::Reload) => self.reload(),
                 Ok(Event::Reconnect) => self.connect(),
+                Ok(Event::Shutdown(ack)) => {
+                    self.on_shutdown();
+                    let _ = ack.send(());
+                }
                 Ok(Event::Quit) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => self.keepalive(),
             }
@@ -288,6 +305,32 @@ impl Controller {
             }
         }
         self.feedback.info("Settings reloaded");
+    }
+
+    /// Turns the receiver off for a shutdown, but only if it's still on the
+    /// startup shortcut's input: on any other input something else (a
+    /// console, a TV box) is using it.
+    fn on_shutdown(&mut self) {
+        if !self.cfg.general.shutdown_power_off || !self.has_receiver() {
+            return;
+        }
+        let Some(input) = self.cfg.startup_input().map(str::to_string) else {
+            return;
+        };
+        let result = (|| -> anyhow::Result<bool> {
+            if self.receiver.query("PWR")? != "01"
+                || !self.receiver.query("SLI")?.eq_ignore_ascii_case(&input)
+            {
+                return Ok(false);
+            }
+            self.receiver.send("PWR00")?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => eprintln!("shutdown: receiver turned off"),
+            Ok(false) => eprintln!("shutdown: receiver off or on another input, left alone"),
+            Err(e) => eprintln!("shutdown: {e:#}"),
+        }
     }
 
     fn trigger(&mut self, id: &str) {

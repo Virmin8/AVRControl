@@ -2345,6 +2345,23 @@ impl SettingsApp {
                             self.cfg.general.startup_shortcut = choice;
                         });
                     });
+                    let startup_input = self.cfg.startup_input().map(|c| self.cfg.input_label(c));
+                    ui.add_enabled_ui(startup_input.is_some(), |ui| {
+                        let label = match &startup_input {
+                            Some(input) => format!(
+                                "Turn the receiver off when this PC shuts down, if it's still on {input}"
+                            ),
+                            None => "Turn the receiver off when this PC shuts down".into(),
+                        };
+                        ui.checkbox(&mut self.cfg.general.shutdown_power_off, label)
+                            .on_hover_text(
+                                "Left on if you've switched to another input (a console, a TV box), \
+                                 and when restarting.",
+                            )
+                            .on_disabled_hover_text(
+                                "Needs a startup action that switches the receiver's input.",
+                            );
+                    });
                     ui.add_space(6.0);
                     ui.checkbox(
                         &mut self.cfg.general.notifications,
