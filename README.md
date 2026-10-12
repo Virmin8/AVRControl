@@ -34,18 +34,22 @@ hotkeys. It runs in the system tray on Linux (Wayland and X11) and Windows.
 
 ### Monitors
 - Lists monitors that support DDC/CI input switching, with their current
-  input and the inputs they advertise; one click switches input.
+  input and the inputs they advertise; one click on the Status page
+  switches input.
 - On KDE Plasma also shows resolution, refresh rate, scale, position,
   rotation, colour depth, HDR, wide colour gamut, adaptive sync and screen
   size, plus brightness and contrast over DDC/CI.
 
 ### Status
-- A Status page with live receiver state (power, input, volume, listening
-  mode, HDMI output), the incoming video and audio signal, zones, and every
+- A Status page styled like the receiver's front panel: the current input,
+  volume and listening mode on an amber display with format indicators
+  (HDMI, Atmos, 4K, HDR, ...), input keys, a volume slider, the incoming
+  video and audio signal, zones, and one-click input switching for every
   monitor.
+- The receiver's connection and power state show at the top of every page.
 - The tray tooltip shows the same at a glance.
-- Volume changes show Plasma's own volume OSD on KDE, or a small overlay
-  elsewhere. Actions show desktop notifications.
+- Volume changes show a small front-panel style overlay. Actions show
+  desktop notifications.
 
 ### Desktop integration
 - Linux: Wayland and X11. Hotkeys go through the XDG Global Shortcuts portal
@@ -60,8 +64,9 @@ or running `avrcontrol` while the app is already running.
 
 | Tab | What it shows |
 | --- | --- |
-| Receiver | IP address (**Find on network** searches for it), connection test, model, power, current input and volume. Also lets you rename or hide receiver inputs. |
-| Monitors | Every connected display with its graphics-card connector (e.g. `DP-1`), its current input, the inputs it supports, and buttons to switch inputs immediately. |
+| Status | Live receiver state, input keys, the volume slider, video and audio signal, zones, and buttons to switch each monitor's input. |
+| Receiver | **Controls**: every supported function, grouped into power and volume, sound, HDMI, system and zones, plus raw commands. **Setup**: IP address (**Find on network** searches for it), connection test, volume steps, supported features, and renaming or hiding receiver inputs. |
+| Monitors | Everything each connected display reports: graphics-card connector (e.g. `DP-1`), current input, signal, resolution, HDR, brightness and more. |
 | Shortcuts | Add, edit and reorder shortcuts. Set the hotkey (type it or press **Record**), then pick a receiver input and a target input for each monitor. |
 | General | Startup action, turning the receiver off at shutdown (only if it is still on the startup input), notifications, volume indicator, start on login, and start/stop of the background service. |
 
@@ -213,8 +218,9 @@ order, e.g. `avrcontrol list | more`.
 
 ## Volume indicator
 
-On KDE Plasma, volume changes use Plasma's own on-screen display. Elsewhere,
-AVR Control shows a small overlay window of its own.
+Volume changes show a small overlay in the same front-panel style as the
+settings window, on Linux and Windows alike. On Wayland the desktop decides
+where it appears.
 
 ## Receiver model table
 

@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use notify_rust::Notification;
 
@@ -14,10 +15,14 @@ pub struct Feedback {
     half_steps: bool,
     #[cfg(target_os = "linux")]
     last_id: Option<u32>,
-    #[cfg(target_os = "linux")]
-    kde_osd: Option<zbus::blocking::Connection>,
     osd_child: Option<(Child, ChildStdin)>,
+    /// When the overlay was last sent a value.
+    osd_written: Instant,
 }
+
+/// Stop reusing an overlay this long after its last value: it closes itself
+/// at `osd::HIDE_AFTER`, and a value sent while it closes would be lost.
+const OSD_REUSE: Duration = Duration::from_millis(1500);
 
 fn notification_icon() -> String {
     #[cfg(target_os = "linux")]
@@ -49,9 +54,8 @@ impl Feedback {
             half_steps: false,
             #[cfg(target_os = "linux")]
             last_id: None,
-            #[cfg(target_os = "linux")]
-            kde_osd: None,
             osd_child: None,
+            osd_written: Instant::now(),
         };
         f.apply_config(cfg);
         f
@@ -120,31 +124,7 @@ impl Feedback {
                 .round()
                 .clamp(0.0, 100.0) as i32
         };
-        #[cfg(target_os = "linux")]
-        if self.kde_volume(percent, &text) {
-            return;
-        }
         self.overlay_volume(percent, &text);
-    }
-
-    /// Plasma's own volume OSD. It only renders a percentage bar, so the exact
-    /// receiver value goes into the label.
-    #[cfg(target_os = "linux")]
-    fn kde_volume(&mut self, percent: i32, text: &str) -> bool {
-        if self.kde_osd.is_none() {
-            self.kde_osd = zbus::blocking::Connection::session().ok();
-        }
-        let Some(conn) = &self.kde_osd else {
-            return false;
-        };
-        conn.call_method(
-            Some("org.kde.plasmashell"),
-            "/org/kde/osdService",
-            Some("org.kde.osdService"),
-            "mediaPlayerVolumeChanged",
-            &(percent, format!("Onkyo receiver  {text}"), "audio-card"),
-        )
-        .is_ok()
     }
 
     /// Our own overlay window, run as a child process (`avrcontrol osd`)
@@ -152,9 +132,12 @@ impl Feedback {
     /// a short idle period.
     fn overlay_volume(&mut self, percent: i32, text: &str) {
         let line = format!("{percent} {text}\n");
+        let fresh = self.osd_written.elapsed() < OSD_REUSE;
+        self.osd_written = Instant::now();
         if let Some((child, stdin)) = &mut self.osd_child {
             let alive = matches!(child.try_wait(), Ok(None));
             if alive
+                && fresh
                 && stdin
                     .write_all(line.as_bytes())
                     .and_then(|_| stdin.flush())
@@ -163,7 +146,10 @@ impl Feedback {
                 return;
             }
         }
+        // An overlay that's about to close (or already has) is replaced, not
+        // reused.
         if let Some((mut child, _)) = self.osd_child.take() {
+            let _ = child.kill();
             let _ = child.wait();
         }
         let Ok(exe) = std::env::current_exe() else {

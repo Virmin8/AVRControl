@@ -2,6 +2,7 @@
 //! layers report presses and releases; this re-sends the trigger at a fixed
 //! rate in between.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -22,8 +23,23 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static RELEASE_SEEN: AtomicBool = AtomicBool::new(false);
 /// Bumped on every press and release; a repeat loop stops once it changes.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The repeatable shortcut currently held down, if any. Some desktops resend
+/// "pressed" at their own key-repeat rate while a key is held; those extra
+/// presses are ignored so the rate is always ours. Expires with MAX_HOLD in
+/// case a release is missed.
+static HELD: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
 pub fn pressed(tx: &Sender<Event>, id: &str, repeatable: bool) {
+    if repeatable && RELEASE_SEEN.load(Ordering::SeqCst) {
+        let mut held = HELD.lock().unwrap();
+        if held
+            .as_ref()
+            .is_some_and(|(h, at)| h == id && at.elapsed() < MAX_HOLD)
+        {
+            return;
+        }
+        *held = Some((id.to_string(), Instant::now()));
+    }
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = tx.send(Event::Trigger(id.to_string()));
     if !repeatable || !RELEASE_SEEN.load(Ordering::SeqCst) {
@@ -46,6 +62,7 @@ pub fn pressed(tx: &Sender<Event>, id: &str, repeatable: bool) {
 }
 
 pub fn released() {
+    *HELD.lock().unwrap() = None;
     RELEASE_SEEN.store(true, Ordering::SeqCst);
     GENERATION.fetch_add(1, Ordering::SeqCst);
 }

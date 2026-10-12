@@ -89,13 +89,22 @@ struct SettingsApp {
     update_check: Task<String>,
     /// When the receiver status was last requested (auto-refresh on the Receiver tab).
     status_at: Instant,
-    show_receiver_settings: bool,
+    /// Receiver tab: setup (features, inputs, volume scale) instead of controls.
+    receiver_setup: bool,
     monitors_at: Instant,
     /// A control-panel button press in flight.
     command: Task<Option<String>>,
     /// "Sent X -> reply" for the control panel.
     last_command: String,
     volume_target: u8,
+    /// Volume picked on the Status page slider, not sent yet (one command
+    /// is in flight at a time).
+    volume_want: Option<f32>,
+    /// Volume sent from the slider, shown until the receiver reports it, so
+    /// the slider doesn't jump back while the status catches up.
+    volume_pending: Option<(f32, Instant)>,
+    /// Wheel movement over the slider not yet turned into a volume step.
+    slider_scroll: f32,
     raw_command: String,
     /// Detection runs automatically once per session when nothing is stored yet.
     auto_probed: bool,
@@ -107,8 +116,8 @@ struct SettingsApp {
 /// (command group, label, [(code, option label)])
 type ChoiceRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
-/// "Label  [opt] [opt] [opt]" grid row; the current value is highlighted and
-/// a click queues `<group><code>`.
+/// "Label  [opt|opt|opt]" grid row; the current value is highlighted and a
+/// click queues `<group><code>`. Long lists become a dropdown.
 fn choice_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -117,15 +126,128 @@ fn choice_row(
     group: &str,
     cmd: &mut Option<String>,
 ) {
-    ui.label(label);
-    ui.horizontal(|ui| {
-        for (code, name) in options {
-            if theme::choice(ui, *name, current == Some(*code)).clicked() {
-                *cmd = Some(format!("{group}{code}"));
-            }
+    if options.is_empty() {
+        return;
+    }
+    ui.label(RichText::new(label).color(theme::TEXT_SECONDARY));
+    if options.len() <= 4 {
+        let names: Vec<&str> = options.iter().map(|o| o.1).collect();
+        let selected = options.iter().position(|o| Some(o.0) == current);
+        if let Some(i) = theme::segmented(ui, group, &names, selected) {
+            *cmd = Some(format!("{group}{}", options[i].0));
         }
-    });
+    } else {
+        let text = options
+            .iter()
+            .find(|o| Some(o.0) == current)
+            .map(|o| o.1)
+            .unwrap_or("–");
+        egui::ComboBox::from_id_salt(("ctl", group))
+            .selected_text(text)
+            .width(170.0)
+            .show_ui(ui, |ui| {
+                for (code, name) in options {
+                    if ui.selectable_label(current == Some(*code), *name).clicked() {
+                        *cmd = Some(format!("{group}{code}"));
+                    }
+                }
+            });
+    }
     ui.end_row();
+}
+
+/// A `ChoiceRow` narrowed to the options the model accepts.
+type SupportedRow<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+
+/// A card of `choice_row`s, left out entirely when the model supports none
+/// of them.
+fn settings_card(
+    ui: &mut egui::Ui,
+    icon: &str,
+    title: &str,
+    cfg: &Config,
+    st: &ReceiverStatus,
+    rows: &[ChoiceRow],
+    cmd: &mut Option<String>,
+) {
+    let rows: Vec<SupportedRow> = rows
+        .iter()
+        .filter(|(group, _, _)| cfg.supports(group))
+        .map(|(group, label, options)| {
+            let options = options
+                .iter()
+                .copied()
+                .filter(|(code, _)| cfg.supports_value(group, code))
+                .collect();
+            (*group, *label, options)
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    theme::card(ui, icon, title, None, |ui| {
+        controls_grid(ui, title, |ui| {
+            for (group, label, options) in &rows {
+                let current = if *group == "HDO" {
+                    st.hdmi_output.as_deref()
+                } else {
+                    st.extra.get(*group).map(String::as_str)
+                };
+                choice_row(ui, label, current, options, group, cmd);
+            }
+        });
+    });
+    ui.add_space(12.0);
+}
+
+/// Two-column "label  control" grid used by every controls card.
+fn controls_grid(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Grid::new(("controls", id))
+        .num_columns(2)
+        .min_col_width(130.0)
+        .spacing([16.0, 10.0])
+        .show(ui, add);
+}
+
+/// The receiver's inputs as hardware-style keys, filling `width` in equal
+/// rows. A click on another input queues `SLI<code>`.
+fn input_keys(
+    ui: &mut egui::Ui,
+    cfg: &Config,
+    current: Option<&str>,
+    width: f32,
+    busy: bool,
+    cmd: &mut Option<String>,
+) {
+    if !cfg.supports("SLI") {
+        ui.label(
+            RichText::new("This receiver can't switch inputs over the network.")
+                .color(theme::TEXT_MUTED),
+        );
+        return;
+    }
+    let inputs: Vec<(&str, String)> = eiscp::INPUTS
+        .iter()
+        .filter(|(c, _)| {
+            !cfg.receiver.hidden_inputs.iter().any(|h| h == c) && cfg.supports_value("SLI", c)
+        })
+        .map(|(c, _)| (*c, cfg.input_label(c)))
+        .collect();
+    let spacing = 8.0;
+    let per_row = (((width + spacing) / (100.0 + spacing)).floor() as usize).max(1);
+    let key_w = (width - spacing * (per_row - 1) as f32) / per_row as f32;
+    for row in inputs.chunks(per_row) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = spacing;
+            for (code, label) in row {
+                let on = current == Some(*code);
+                if theme::input_key(ui, label, on, key_w).clicked() && !busy && !on {
+                    *cmd = Some(format!("SLI{code}"));
+                }
+            }
+        });
+        ui.add_space(spacing - ui.spacing().item_spacing.y);
+    }
 }
 
 /// A dropdown over one or more (code, name) tables.
@@ -179,7 +301,7 @@ fn nonempty(s: &str) -> String {
     }
 }
 
-/// One monitor's full details for the Status page. Every card shows the
+/// One monitor's full details for the Monitors tab. Every card shows the
 /// same rows in the same order so cards side by side line up.
 fn monitor_card(ui: &mut egui::Ui, m: &MonitorInfo) {
     let dash = || "–".to_string();
@@ -302,14 +424,6 @@ fn err_color(ui: &egui::Ui) -> Color32 {
     ui.visuals().error_fg_color
 }
 
-fn ok_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(110, 200, 120)
-    } else {
-        Color32::from_rgb(30, 130, 50)
-    }
-}
-
 impl SettingsApp {
     fn new(ctx: &egui::Context, tab: Tab) -> Self {
         let cfg = Config::load().unwrap_or_default();
@@ -328,11 +442,14 @@ impl SettingsApp {
             probe: Task::new(),
             update_check: Task::new(),
             status_at: Instant::now(),
-            show_receiver_settings: false,
+            receiver_setup: false,
             monitors_at: Instant::now(),
             command: Task::new(),
             last_command: String::new(),
             volume_target: 40,
+            volume_want: None,
+            volume_pending: None,
+            slider_scroll: 0.0,
             raw_command: String::new(),
             auto_probed: false,
             autostart: autostart::is_enabled(),
@@ -543,33 +660,34 @@ impl SettingsApp {
 
     fn receiver_tab(&mut self, ui: &mut egui::Ui) {
         let has_host = !self.cfg.receiver.host.trim().is_empty();
-        let mut open_settings = false;
         let mut test = false;
-        theme::page_header(ui, "Receiver", "Connection and live controls.", |ui| {
-            if ui
-                .add_enabled(
-                    has_host,
-                    egui::Button::new(format!("{}  Receiver settings", icon::SLIDERS))
-                        .min_size(egui::vec2(0.0, 32.0)),
-                )
-                .on_hover_text("Supported features, inputs and volume scale")
-                .clicked()
-            {
-                open_settings = true;
-            }
-            if ui
-                .add_enabled(
-                    has_host && !self.receiver.running(),
-                    egui::Button::new(format!("{}  Test connection", icon::REFRESH))
-                        .min_size(egui::vec2(0.0, 32.0)),
-                )
-                .clicked()
-            {
-                test = true;
-            }
-        });
-        if open_settings {
-            self.show_receiver_settings = true;
+        let mut view = None;
+        theme::page_header(
+            ui,
+            "Receiver",
+            if self.receiver_setup {
+                "Volume scale, supported features and inputs."
+            } else {
+                "Connection, and live controls sent straight to the receiver."
+            },
+            |ui| {
+                if ui
+                    .add_enabled(
+                        has_host && !self.receiver.running(),
+                        egui::Button::new(format!("{}  Test connection", icon::REFRESH))
+                            .min_size(egui::vec2(0.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    test = true;
+                }
+                ui.add_space(6.0);
+                let selected = Some(usize::from(self.receiver_setup));
+                view = theme::segmented(ui, "receiver_view", &["Controls", "Setup"], selected);
+            },
+        );
+        if let Some(i) = view {
+            self.receiver_setup = i == 1;
         }
         if test {
             self.refresh_receiver(ui.ctx());
@@ -651,109 +769,26 @@ impl SettingsApp {
             },
         );
 
+        if self.receiver_setup {
+            ui.add_space(12.0);
+            self.receiver_settings_ui(ui);
+            return;
+        }
         let Some(status) = self.receiver.ok().cloned() else {
             return;
         };
         ui.add_space(12.0);
-        let last = self.last_command.clone();
         let mut cmd: Option<String> = None;
-        theme::card_with(
-            ui,
-            icon::SLIDERS,
-            "Controls",
-            Some("Sent straight to the receiver, for testing without a shortcut."),
-            |ui| {
-                if !last.is_empty() {
-                    ui.label(RichText::new(last).color(theme::TEXT_MUTED).monospace());
-                }
-            },
-            |ui| {
-                ui.add_enabled_ui(!self.command.running(), |ui| {
-                    self.controls(ui, &status, &mut cmd);
-                });
-            },
-        );
-        if let Some(c) = cmd {
+        self.controls(ui, &status, &mut cmd);
+        // One command at a time; clicks while one is in flight are dropped.
+        if let Some(c) = cmd
+            && !self.command.running()
+        {
             self.send_command(ui.ctx(), c);
         }
     }
 
-    /// Overall health for the header pill and the sidebar.
-    fn health(&self) -> (String, Color32, Color32) {
-        if self.cfg.receiver.host.trim().is_empty() {
-            return (
-                "No receiver configured".into(),
-                theme::WARNING,
-                theme::WARNING_BORDER,
-            );
-        }
-        match &self.receiver.result {
-            Some(Err(_)) => (
-                "Receiver unreachable".into(),
-                theme::DANGER,
-                theme::DANGER_BORDER,
-            ),
-            None => (
-                "Connecting…".into(),
-                theme::TEXT_MUTED,
-                theme::BORDER_STRONG,
-            ),
-            Some(Ok(s)) => {
-                let failing = self
-                    .monitors
-                    .ok()
-                    .map(|l| {
-                        l.iter()
-                            .filter(|m| m.ddc && m.current_input.is_none())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                if failing > 0 {
-                    (
-                        format!("{failing} monitor(s) not answering"),
-                        theme::WARNING,
-                        theme::WARNING_BORDER,
-                    )
-                } else if !s.power_on {
-                    (
-                        "Receiver in standby".into(),
-                        theme::WARNING,
-                        theme::WARNING_BORDER,
-                    )
-                } else {
-                    (
-                        "All systems normal".into(),
-                        theme::SUCCESS,
-                        theme::SUCCESS_BORDER,
-                    )
-                }
-            }
-        }
-    }
-
     fn status_page(&mut self, ui: &mut egui::Ui) {
-        let (health, color, border) = self.health();
-        let mut refresh = false;
-        theme::page_header(
-            ui,
-            "Status",
-            "Live information from your receiver and monitors.",
-            |ui| {
-                if ui
-                    .add(egui::Button::new(icon::REFRESH).min_size(egui::vec2(34.0, 32.0)))
-                    .on_hover_text("Refresh now")
-                    .clicked()
-                {
-                    refresh = true;
-                }
-                theme::status_pill(ui, &health, color, border);
-            },
-        );
-        if refresh {
-            self.refresh_receiver(ui.ctx());
-            self.scan_monitors(ui.ctx());
-        }
-
         let cfg = self.cfg.clone();
         let st = self.receiver.ok().cloned();
         // Only monitors whose input can be switched (DDC/CI).
@@ -764,410 +799,665 @@ impl SettingsApp {
             .unwrap_or_default();
         let dash = || "–".to_string();
 
-        // Summary tiles.
-        theme::columns(ui, 4, |cols| {
-            let power = st.as_ref().map(|s| s.power_on);
-            theme::card(&mut cols[0], icon::POWER, "Receiver", None, |ui| {
-                match power {
-                    Some(true) => theme::kv_colored(ui, "Power", "On", theme::SUCCESS),
-                    Some(false) => theme::kv_colored(ui, "Power", "Standby", theme::WARNING),
-                    None => theme::kv_colored(ui, "Power", "Offline", theme::DANGER),
-                }
-                let input = st
-                    .as_ref()
-                    .and_then(|s| s.input.as_deref())
-                    .map(|i| cfg.input_label(i));
-                theme::kv(ui, "Input", input.unwrap_or_else(dash));
+        self.front_panel(ui, st.as_ref());
+        if let Some(Err(e)) = &self.receiver.result {
+            ui.add_space(6.0);
+            ui.colored_label(theme::DANGER, format!("Can't reach receiver: {e}"));
+        }
+        ui.add_space(18.0);
+
+        let Some(st) = st else {
+            self.monitor_switch_cards(ui, &monitors);
+            return;
+        };
+
+        let mut cmd: Option<String> = None;
+        self.input_and_volume(ui, &st, &mut cmd);
+        if let Some(c) = cmd {
+            self.send_command(ui.ctx(), c);
+        }
+        ui.add_space(22.0);
+
+        let extra = |g: &str| st.extra.get(g).cloned();
+        theme::columns(ui, 3, |cols| {
+            theme::spec(&mut cols[0], "Video", |ui| {
+                let v = st.video.clone().unwrap_or_default();
+                theme::kv(ui, "Input port", nonempty(&v.input_port));
+                theme::kv(ui, "Input resolution", nonempty(&v.input_resolution));
+                theme::kv(ui, "Input colour", nonempty(&v.input_color));
+                theme::kv(ui, "Output port", nonempty(&v.output_port));
+                theme::kv(ui, "Output resolution", nonempty(&v.output_resolution));
+                theme::kv(ui, "Output colour", nonempty(&v.output_color));
+                theme::kv(ui, "Picture mode", nonempty(&v.picture_mode));
             });
-            theme::card(&mut cols[1], icon::VOLUME, "Sound", None, |ui| {
-                let vol = st
-                    .as_ref()
-                    .and_then(|s| s.volume)
-                    .map(|v| cfg.volume_text(v));
-                if st.as_ref().and_then(|s| s.muted) == Some(true) {
-                    theme::kv_colored(ui, "Volume", "Muted", theme::WARNING);
-                } else {
-                    theme::kv(ui, "Volume", vol.unwrap_or_else(dash));
-                }
-                let mode = st
-                    .as_ref()
-                    .and_then(|s| s.listening_mode.as_deref())
-                    .map(eiscp::listening_mode_name);
-                theme::kv(ui, "Mode", mode.unwrap_or_else(dash));
+            theme::spec(&mut cols[1], "Audio", |ui| {
+                let a = st.audio_info.clone().unwrap_or_default();
+                theme::kv_colored(
+                    ui,
+                    "Format",
+                    nonempty(&a.format),
+                    if a.format.is_empty() {
+                        theme::TEXT
+                    } else {
+                        theme::ACCENT
+                    },
+                );
+                theme::kv(ui, "Input port", nonempty(&a.input_port));
+                theme::kv(ui, "Sample rate", nonempty(&a.sample_rate));
+                theme::kv(ui, "Input channels", nonempty(&a.input_channels));
+                theme::kv(ui, "Listening mode", nonempty(&a.listening_mode));
+                theme::kv(ui, "Output channels", nonempty(&a.output_channels));
+                theme::kv(ui, "Output sample rate", nonempty(&a.output_sample_rate));
             });
-            theme::card(&mut cols[2], icon::TV, "Video", None, |ui| {
-                let v = st.as_ref().and_then(|s| s.video.clone());
+            theme::spec(&mut cols[2], "Receiver", |ui| {
+                theme::kv_colored(
+                    ui,
+                    "Power",
+                    if st.power_on { "On" } else { "Standby" },
+                    if st.power_on {
+                        theme::SUCCESS
+                    } else {
+                        theme::WARNING
+                    },
+                );
                 theme::kv(
                     ui,
                     "Input",
-                    v.as_ref()
-                        .map(|v| v.input_port.clone())
+                    st.input
+                        .as_deref()
+                        .map(|i| format!("{} ({i})", cfg.input_label(i)))
                         .unwrap_or_else(dash),
                 );
                 theme::kv(
                     ui,
-                    "Signal",
-                    v.as_ref()
-                        .map(|v| nonempty(&v.input_resolution))
+                    "Mute",
+                    if st.muted == Some(true) { "On" } else { "Off" },
+                );
+                theme::kv(
+                    ui,
+                    "HDMI output",
+                    st.hdmi_output
+                        .as_deref()
+                        .map(eiscp::hdmi_output_name)
                         .unwrap_or_else(dash),
                 );
-            });
-            theme::card(&mut cols[3], icon::MONITOR, "Monitors", None, |ui| {
-                theme::kv(ui, "Switchable", monitors.len().to_string());
-                let ok = monitors
-                    .iter()
-                    .filter(|m| m.current_input.is_some())
-                    .count();
-                let color = if ok == monitors.len() {
-                    theme::SUCCESS
-                } else {
-                    theme::WARNING
-                };
-                theme::kv_colored(
-                    ui,
-                    "Answering",
-                    format!("{ok} of {}", monitors.len()),
-                    color,
-                );
-            });
-        });
-        ui.add_space(12.0);
-
-        match &st {
-            None => {
-                if let Some(Err(e)) = &self.receiver.result {
-                    ui.colored_label(theme::DANGER, format!("Can't reach receiver: {e}"));
-                    ui.add_space(12.0);
-                }
-            }
-            Some(st) => {
-                // Receiver, video and audio side by side, same height.
-                let body = 8.0 * theme::ROW_HEIGHT;
-                theme::columns(ui, 3, |cols| {
-                    let model = st
-                        .model
-                        .clone()
-                        .or(Some(cfg.receiver.model.clone()))
-                        .filter(|m| !m.is_empty());
-                    theme::card_sized(
-                        &mut cols[0],
-                        icon::SPEAKER,
-                        &model
-                            .map(|m| format!("Onkyo {m}"))
-                            .unwrap_or("Receiver".into()),
-                        Some(&format!("{}:{}", cfg.receiver.host, cfg.receiver.port)),
-                        body,
-                        |_| {},
-                        |ui| {
-                            let extra = |g: &str| st.extra.get(g).cloned();
-                            theme::kv_colored(
-                                ui,
-                                "Power",
-                                if st.power_on { "On" } else { "Standby" },
-                                if st.power_on {
-                                    theme::SUCCESS
-                                } else {
-                                    theme::WARNING
-                                },
-                            );
-                            theme::kv(
-                                ui,
-                                "Input",
-                                st.input
-                                    .as_deref()
-                                    .map(|i| format!("{} ({i})", cfg.input_label(i)))
-                                    .unwrap_or_else(dash),
-                            );
-                            theme::kv(
-                                ui,
-                                "Volume",
-                                st.volume.map(|v| cfg.volume_text(v)).unwrap_or_else(dash),
-                            );
-                            theme::kv(
-                                ui,
-                                "Mute",
-                                if st.muted == Some(true) { "On" } else { "Off" },
-                            );
-                            theme::kv(
-                                ui,
-                                "Listening mode",
-                                st.listening_mode
-                                    .as_deref()
-                                    .map(eiscp::listening_mode_name)
-                                    .unwrap_or_else(dash),
-                            );
-                            theme::kv(
-                                ui,
-                                "HDMI output",
-                                st.hdmi_output
-                                    .as_deref()
-                                    .map(eiscp::hdmi_output_name)
-                                    .unwrap_or_else(dash),
-                            );
-                            let hao = extra("HAO").map(|v| match v.as_str() {
-                                "00" => "Off".to_string(),
-                                "01" => "On".to_string(),
-                                "02" => "Auto".to_string(),
-                                o => o.to_string(),
-                            });
-                            theme::kv(ui, "HDMI audio out", hao.unwrap_or_else(dash));
-                            let sla = extra("SLA").map(|v| {
-                                match v.as_str() {
-                                    "00" => "Auto",
-                                    "01" => "Multichannel",
-                                    "02" => "Analog",
-                                    "03" => "iLINK",
-                                    "04" => "HDMI",
-                                    "05" => "Coax/Optical",
-                                    "06" => "Balanced",
-                                    "07" => "ARC",
-                                    _ => "?",
-                                }
-                                .to_string()
-                            });
-                            theme::kv(ui, "Audio selector", sla.unwrap_or_else(dash));
-                        },
-                    );
-                    theme::card_sized(
-                        &mut cols[1],
-                        icon::TV,
-                        "Video signal",
-                        None,
-                        body,
-                        |_| {},
-                        |ui| {
-                            let v = st.video.clone().unwrap_or_default();
-                            theme::kv(ui, "Input port", nonempty(&v.input_port));
-                            theme::kv(ui, "Input resolution", nonempty(&v.input_resolution));
-                            theme::kv(ui, "Input colour", nonempty(&v.input_color));
-                            theme::kv(ui, "Output port", nonempty(&v.output_port));
-                            theme::kv(ui, "Output resolution", nonempty(&v.output_resolution));
-                            theme::kv(ui, "Output colour", nonempty(&v.output_color));
-                            theme::kv(ui, "Picture mode", nonempty(&v.picture_mode));
-                        },
-                    );
-                    theme::card_sized(
-                        &mut cols[2],
-                        icon::WAVEFORM,
-                        "Audio signal",
-                        None,
-                        body,
-                        |_| {},
-                        |ui| {
-                            let a = st.audio_info.clone().unwrap_or_default();
-                            theme::kv(ui, "Input port", nonempty(&a.input_port));
-                            theme::kv(ui, "Format", nonempty(&a.format));
-                            theme::kv(ui, "Sample rate", nonempty(&a.sample_rate));
-                            theme::kv(ui, "Input channels", nonempty(&a.input_channels));
-                            theme::kv(ui, "Listening mode", nonempty(&a.listening_mode));
-                            theme::kv(ui, "Output channels", nonempty(&a.output_channels));
-                            theme::kv(ui, "Output sample rate", nonempty(&a.output_sample_rate));
-                        },
-                    );
+                let hao = extra("HAO").map(|v| match v.as_str() {
+                    "00" => "Off".to_string(),
+                    "01" => "On".to_string(),
+                    "02" => "Auto".to_string(),
+                    o => o.to_string(),
                 });
-                ui.add_space(12.0);
-
+                theme::kv(ui, "HDMI audio out", hao.unwrap_or_else(dash));
+                let sla = extra("SLA").map(|v| {
+                    match v.as_str() {
+                        "00" => "Auto",
+                        "01" => "Multichannel",
+                        "02" => "Analog",
+                        "03" => "iLINK",
+                        "04" => "HDMI",
+                        "05" => "Coax/Optical",
+                        "06" => "Balanced",
+                        "07" => "ARC",
+                        _ => "?",
+                    }
+                    .to_string()
+                });
+                theme::kv(ui, "Audio selector", sla.unwrap_or_else(dash));
                 // Zones, only when the receiver has them.
-                let zones: Vec<(&str, &str, &str, &str, &str)> = [
+                for (label, pwr, sel, vol, mute) in [
                     ("Zone 2", "ZPW", "SLZ", "ZVL", "ZMT"),
                     ("Zone 3", "PW3", "SL3", "VL3", "MT3"),
-                ]
-                .into_iter()
-                .filter(|z| st.extra.contains_key(z.1))
-                .collect();
-                if !zones.is_empty() {
-                    theme::columns(ui, zones.len().max(2), |cols| {
-                        for (col, (label, pwr, sel, vol, mute)) in cols.iter_mut().zip(&zones) {
-                            let extra = |g: &str| st.extra.get(g).cloned();
-                            theme::card(col, icon::HOUSE, label, None, |ui| {
-                                let on = extra(pwr).as_deref() == Some("01");
-                                theme::kv_colored(
-                                    ui,
-                                    "Power",
-                                    if on { "On" } else { "Standby" },
-                                    if on {
-                                        theme::SUCCESS
-                                    } else {
-                                        theme::TEXT_MUTED
-                                    },
-                                );
-                                let input = extra(sel)
-                                    .map(|c| {
-                                        if c == "80" {
-                                            "Same as main".to_string()
-                                        } else {
-                                            cfg.input_label(&c)
-                                        }
-                                    })
-                                    .unwrap_or_else(dash);
-                                theme::kv(ui, "Input", if on { input } else { dash() });
-                                let volume = extra(vol)
-                                    .and_then(|v| u8::from_str_radix(&v, 16).ok())
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(dash);
-                                let muted = extra(mute).as_deref() == Some("01");
-                                theme::kv(
-                                    ui,
-                                    "Volume",
-                                    if !on {
-                                        dash()
-                                    } else if muted {
-                                        "Muted".into()
-                                    } else {
-                                        volume
-                                    },
-                                );
-                            });
-                        }
-                    });
-                    ui.add_space(12.0);
+                ] {
+                    if !st.extra.contains_key(pwr) {
+                        continue;
+                    }
+                    if extra(pwr).as_deref() != Some("01") {
+                        theme::kv_colored(ui, label, "Standby", theme::TEXT_MUTED);
+                        continue;
+                    }
+                    let input = extra(sel)
+                        .map(|c| {
+                            if c == "80" {
+                                "Same as main".to_string()
+                            } else {
+                                cfg.input_label(&c)
+                            }
+                        })
+                        .unwrap_or_else(dash);
+                    let volume = if extra(mute).as_deref() == Some("01") {
+                        "Muted".to_string()
+                    } else {
+                        extra(vol)
+                            .and_then(|v| u8::from_str_radix(&v, 16).ok())
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(dash)
+                    };
+                    theme::kv(ui, label, format!("{input} · {volume}"));
                 }
-            }
-        }
-
-        ui.add_space(8.0);
-        self.monitor_cards(ui, &monitors);
+            });
+        });
+        ui.add_space(26.0);
+        self.monitor_switch_cards(ui, &monitors);
     }
 
-    fn monitor_cards(&self, ui: &mut egui::Ui, monitors: &[MonitorInfo]) {
-        ui.label(
-            RichText::new("Monitors")
-                .font(egui::FontId::new(18.0, theme::bold()))
-                .color(theme::TEXT),
+    /// The big front-panel display at the top of the Status page.
+    fn front_panel(&self, ui: &mut egui::Ui, st: Option<&ReceiverStatus>) {
+        use theme::VfdState;
+        let cfg = &self.cfg;
+        let no_indicators: Vec<(&str, bool)> = Vec::new();
+        let host = cfg.receiver.host.trim();
+        let (state, source, value, unit, left, right) = match (&self.receiver.result, st) {
+            _ if host.is_empty() => (
+                VfdState::Dim,
+                "NOT SET UP".to_string(),
+                String::new(),
+                "",
+                "Add the receiver on the Receiver tab".to_string(),
+                String::new(),
+            ),
+            (_, Some(s)) if s.power_on => {
+                let muted = s.muted == Some(true);
+                (
+                    VfdState::On,
+                    s.input
+                        .as_deref()
+                        .map(|i| cfg.input_label(i).to_uppercase())
+                        .unwrap_or_else(|| "–".into()),
+                    if muted {
+                        "MUTE".to_string()
+                    } else {
+                        s.volume.map(|v| cfg.volume_text(v)).unwrap_or_default()
+                    },
+                    if muted || s.volume.is_none() {
+                        ""
+                    } else {
+                        "VOL"
+                    },
+                    s.listening_mode
+                        .as_deref()
+                        .map(eiscp::listening_mode_name)
+                        .unwrap_or_default(),
+                    s.hdmi_output
+                        .as_deref()
+                        .map(|o| format!("HDMI {}", eiscp::hdmi_output_name(o)))
+                        .unwrap_or_default(),
+                )
+            }
+            (_, Some(s)) => (
+                VfdState::Dim,
+                "STANDBY".to_string(),
+                String::new(),
+                "",
+                s.input
+                    .as_deref()
+                    .map(|i| format!("Last: {}", cfg.input_label(i)))
+                    .unwrap_or_default(),
+                String::new(),
+            ),
+            (Some(Err(_)), _) => (
+                VfdState::Error,
+                "NO LINK".to_string(),
+                String::new(),
+                "",
+                format!("Retrying {host}"),
+                String::new(),
+            ),
+            _ => (
+                VfdState::Dim,
+                "CONNECTING".to_string(),
+                String::new(),
+                "",
+                host.to_string(),
+                String::new(),
+            ),
+        };
+
+        let indicators = match st {
+            Some(s) if s.power_on => {
+                let v = s.video.clone().unwrap_or_default();
+                let a = s.audio_info.clone().unwrap_or_default();
+                let mode = s
+                    .listening_mode
+                    .as_deref()
+                    .map(eiscp::listening_mode_name)
+                    .unwrap_or_default();
+                let audio = format!("{} {} {}", a.format, a.listening_mode, mode).to_lowercase();
+                let res = format!("{} {}", v.input_resolution, v.output_resolution);
+                let extra = |g: &str| s.extra.get(g).map(String::as_str);
+                vec![
+                    ("HDMI", v.input_port.to_uppercase().contains("HDMI")),
+                    ("ATMOS", audio.contains("atmos")),
+                    ("DTS:X", audio.contains("dts:x") || audio.contains("dts-x")),
+                    (
+                        "4K",
+                        res.contains("3840") || res.contains("4096") || res.contains("4K"),
+                    ),
+                    (
+                        "HDR",
+                        format!("{} {}", v.input_color, v.output_color)
+                            .to_uppercase()
+                            .contains("HDR"),
+                    ),
+                    ("MUTE", s.muted == Some(true)),
+                    ("ZONE 2", extra("ZPW") == Some("01")),
+                    (
+                        "SLEEP",
+                        extra("SLP").is_some_and(|v| v != "00" && v != "OFF"),
+                    ),
+                ]
+            }
+            _ => no_indicators,
+        };
+
+        theme::vfd(
+            ui,
+            &theme::Vfd {
+                state,
+                source: &source,
+                value: &value,
+                unit,
+                left: &left,
+                right: &right,
+                indicators: &indicators,
+            },
         );
-        ui.add_space(6.0);
-        if monitors.is_empty() {
-            let text = if self.monitors.running() {
-                "Scanning monitors…"
-            } else {
-                "No monitors with DDC/CI input switching found."
+    }
+
+    /// Input keys and the volume slider under the display.
+    fn input_and_volume(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &ReceiverStatus,
+        cmd: &mut Option<String>,
+    ) {
+        let cfg = self.cfg.clone();
+        let volume_width = 320.0;
+        let gap = 18.0;
+        let keys_width = (ui.available_width() - volume_width - gap).max(200.0);
+        let busy = self.command.running();
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(keys_width);
+                theme::section_label(ui, "Input");
+                ui.add_space(2.0);
+                input_keys(ui, &cfg, st.input.as_deref(), keys_width, busy, cmd);
+            });
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                ui.set_width(volume_width);
+                theme::section_label(ui, "Volume");
+                ui.add_space(2.0);
+                if !cfg.supports("MVL") {
+                    return;
+                }
+                let max = cfg.volume_max().max(1) as f32;
+                let current = st
+                    .volume
+                    .map(|v| {
+                        if cfg.receiver.volume_half_steps {
+                            v as f32 / 2.0
+                        } else {
+                            v as f32
+                        }
+                    })
+                    .unwrap_or(0.0);
+                if let Some((level, at)) = self.volume_pending
+                    && ((level - current).abs() < 0.01 || at.elapsed() > Duration::from_secs(8))
+                {
+                    self.volume_pending = None;
+                }
+                let shown = self
+                    .volume_want
+                    .or(self.volume_pending.map(|(level, _)| level))
+                    .unwrap_or(current);
+                let half = cfg.receiver.volume_half_steps;
+                let step = if half { 0.5 } else { 1.0 };
+                let text = |level: f32| {
+                    if half {
+                        format!("{level:.1}")
+                    } else {
+                        format!("{level:.0}")
+                    }
+                };
+                egui::Frame::new()
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(theme::RADIUS)
+                    .inner_margin(egui::Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let adjusting = self.volume_want.is_some() || self.volume_pending.is_some();
+                        ui.horizontal(|ui| {
+                            let value = if st.muted == Some(true) && !adjusting {
+                                "MUTE".to_string()
+                            } else if st.volume.is_some() || adjusting {
+                                text(shown)
+                            } else {
+                                "–".to_string()
+                            };
+                            ui.label(
+                                RichText::new(value)
+                                    .font(egui::FontId::new(22.0, theme::mono_bold()))
+                                    .color(if st.power_on {
+                                        theme::ACCENT
+                                    } else {
+                                        theme::TEXT_DIM
+                                    }),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("max {}", cfg.volume_max()))
+                                            .font(egui::FontId::new(12.0, theme::mono()))
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(2.0);
+                        let resp = theme::volume_slider(ui, shown / max, st.power_on);
+                        if !st.power_on {
+                            return;
+                        }
+                        // Click or drag picks a level.
+                        if (resp.is_pointer_button_down_on() || resp.dragged())
+                            && let Some(pos) = resp.interact_pointer_pos()
+                        {
+                            let f =
+                                ((pos.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
+                            let level = (f * max / step).round() * step;
+                            if (level - shown).abs() > 0.01 {
+                                self.volume_want = Some(level);
+                            }
+                        }
+                        if resp.hovered() {
+                            // Take the wheel from the page's scroll area, and
+                            // step once per notch's worth of scrolling.
+                            let delta = ui
+                                .ctx()
+                                .input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta).y);
+                            self.slider_scroll += delta;
+                            const NOTCH: f32 = 24.0;
+                            while self.slider_scroll.abs() >= NOTCH {
+                                let dir = self.slider_scroll.signum();
+                                let base = self.volume_want.unwrap_or(shown);
+                                self.volume_want = Some((base + dir * step).clamp(0.0, max));
+                                self.slider_scroll -= NOTCH * dir;
+                            }
+                        } else {
+                            self.slider_scroll = 0.0;
+                        }
+                        // Send the latest pick whenever the previous command is done.
+                        if !busy && let Some(level) = self.volume_want.take() {
+                            let raw = if half { level * 2.0 } else { level }.round() as u8;
+                            *cmd = Some(format!("MVL{raw:02X}"));
+                            self.volume_pending = Some((level, Instant::now()));
+                        }
+                        if self.volume_want.is_some() {
+                            ui.ctx().request_repaint();
+                        }
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("Click, drag or scroll")
+                                .size(11.5)
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+            });
+        });
+    }
+
+    /// Compact monitor cards with one-click input switching (Status page).
+    fn monitor_switch_cards(&mut self, ui: &mut egui::Ui, list: &[MonitorInfo]) {
+        theme::section_label(ui, "Monitors");
+        ui.add_space(4.0);
+        if let Some(Err(e)) = &self.monitor_test.result {
+            ui.colored_label(theme::DANGER, format!("Switch failed: {e}"));
+        }
+        if list.is_empty() {
+            let text = match &self.monitors.result {
+                _ if self.monitors.running() => "Scanning monitors…".to_string(),
+                Some(Err(e)) => format!("Scan failed: {e}"),
+                _ => "No monitors with DDC/CI input switching found. DDC/CI may need turning on in the monitor's own menu.".to_string(),
             };
             ui.label(RichText::new(text).color(theme::TEXT_MUTED));
             return;
         }
-        let per_row = monitors.len().clamp(2, 3);
-        for row in monitors.chunks(per_row) {
+        let busy = self.monitor_test.running();
+        let mut test: Option<(MonitorId, u8)> = None;
+        let per_row = list.len().clamp(2, 3);
+        for row in list.chunks(per_row) {
             theme::columns(ui, per_row, |cols| {
-                for (col, m) in cols.iter_mut().zip(row) {
-                    monitor_card(col, m);
+                for (ui, m) in cols.iter_mut().zip(row) {
+                    let subtitle = format!("{}  ·  {}", m.id.mfg, m.connector);
+                    theme::card(ui, icon::MONITOR, &m.id.model, Some(&subtitle), |ui| {
+                        theme::kv(
+                            ui,
+                            "Current input",
+                            m.current_input
+                                .map(monitors::input_name)
+                                .unwrap_or_else(|| "No answer".into()),
+                        );
+                        theme::kv(ui, "Input signal", signal_text(m));
+                        if let Some(d) = &m.mode {
+                            theme::kv(
+                                ui,
+                                "PC output",
+                                format!("{} @ {}", d.resolution(), d.refresh()),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Switch to").color(theme::TEXT_SECONDARY));
+                        ui.horizontal_wrapped(|ui| {
+                            for code in monitors::selectable_inputs(Some(m)) {
+                                let current = m.current_input == Some(code);
+                                if ui
+                                    .add_enabled_ui(!busy, |ui| {
+                                        theme::choice(ui, monitors::input_name(code), current)
+                                    })
+                                    .inner
+                                    .clicked()
+                                {
+                                    test = Some((m.id.clone(), code));
+                                }
+                            }
+                        });
+                        if let Some(e) = &m.error {
+                            ui.colored_label(theme::WARNING, e);
+                        }
+                    });
                 }
             });
             ui.add_space(12.0);
         }
+        if let Some((id, code)) = test {
+            let ctx = ui.ctx().clone();
+            self.monitor_test
+                .start(&ctx, move || monitors::set_input(&id, code));
+        }
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
+    /// Icon rail: page buttons, and a power button at the foot.
+    fn rail(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(2.0);
             ui.label(
-                RichText::new(icon::SPEAKER)
+                RichText::new(icon::AUDIO_LINES)
                     .size(22.0)
-                    .color(theme::ACCENT_STRONG),
+                    .color(theme::ACCENT),
             );
-            ui.label(
-                RichText::new("AVR Control")
-                    .font(egui::FontId::new(20.0, theme::bold()))
-                    .color(theme::TEXT),
-            );
+            ui.add_space(14.0);
+            for (tab, ic, label) in [
+                (Tab::Status, icon::DASHBOARD, "Status"),
+                (Tab::Receiver, icon::SLIDERS, "Receiver"),
+                (Tab::Monitors, icon::MONITOR, "Monitors"),
+                (Tab::Shortcuts, icon::KEYBOARD, "Shortcuts"),
+                (Tab::General, icon::SETTINGS, "General"),
+            ] {
+                if theme::rail_item(ui, ic, label, self.tab == tab).clicked() {
+                    self.tab = tab;
+                    self.recording = false;
+                }
+                ui.add_space(2.0);
+            }
         });
-        ui.add_space(20.0);
-        theme::section_label(ui, "Receiver");
-        ui.add_space(4.0);
 
         let st = self.receiver.ok().cloned();
-        let (state, color, border) = match (&self.receiver.result, &st) {
-            (_, Some(s)) if s.power_on => ("Connected · On", theme::SUCCESS, theme::SUCCESS_BORDER),
-            (_, Some(_)) => ("Connected · Standby", theme::WARNING, theme::WARNING_BORDER),
-            (Some(Err(_)), _) => ("Unreachable", theme::DANGER, theme::DANGER_BORDER),
-            _ => ("Connecting…", theme::TEXT_MUTED, theme::BORDER_STRONG),
-        };
-        egui::Frame::new()
-            .fill(theme::CARD)
-            .stroke(egui::Stroke::new(1.0, border))
-            .corner_radius(theme::RADIUS)
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let model = if self.cfg.receiver.model.is_empty() {
-                    "Onkyo receiver".to_string()
-                } else {
-                    format!("Onkyo {}", self.cfg.receiver.model)
-                };
-                ui.label(
-                    RichText::new(model)
-                        .font(egui::FontId::new(15.5, theme::bold()))
-                        .color(theme::TEXT),
-                );
-                ui.label(RichText::new(state).color(color));
-                if let Some(s) = &st {
-                    let input = s
-                        .input
-                        .as_deref()
-                        .map(|i| self.cfg.input_label(i))
-                        .unwrap_or_default();
-                    let vol = s
-                        .volume
-                        .map(|v| self.cfg.volume_text(v))
-                        .unwrap_or_default();
-                    ui.label(
-                        RichText::new(format!("{input}  ·  {} {vol}", icon::VOLUME))
-                            .size(13.0)
-                            .color(theme::TEXT_SECONDARY),
-                    );
-                }
-            });
-
-        ui.add_space(20.0);
-        theme::section_label(ui, "Pages");
-        ui.add_space(4.0);
-        for (tab, ic, label) in [
-            (Tab::Status, icon::DASHBOARD, "Status"),
-            (Tab::Receiver, icon::SPEAKER, "Receiver"),
-            (Tab::Monitors, icon::MONITOR, "Monitors"),
-            (Tab::Shortcuts, icon::KEYBOARD, "Shortcuts"),
-            (Tab::General, icon::SETTINGS, "General"),
-        ] {
-            if theme::nav_item(ui, ic, label, self.tab == tab).clicked() {
-                self.tab = tab;
-                self.recording = false;
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+            let Some(st) = st else { return };
+            if !self.cfg.supports("PWR") {
+                return;
             }
-            ui.add_space(2.0);
-        }
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::click());
+            let color = if st.power_on {
+                theme::SUCCESS
+            } else {
+                theme::TEXT_DIM
+            };
+            if resp.hovered() {
+                ui.painter()
+                    .rect_filled(rect, theme::RADIUS, theme::CONTROL);
+            }
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon::POWER,
+                egui::FontId::new(19.0, egui::FontFamily::Proportional),
+                color,
+            );
+            let resp = resp
+                .on_hover_text(if st.power_on {
+                    "Put the receiver in standby"
+                } else {
+                    "Turn the receiver on"
+                })
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() && !self.command.running() {
+                let cmd = if st.power_on { "PWR00" } else { "PWR01" };
+                self.send_command(ui.ctx(), cmd.into());
+            }
+        });
+    }
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(4.0);
-            let dirty = self.dirty();
-            if dirty {
-                ui.horizontal(|ui| {
-                    if theme::primary_button(ui, format!("{}  Save", icon::SAVE)).clicked() {
-                        self.save();
-                    }
+    /// Receiver connection state for the device line: (text, colour).
+    fn connection(&self) -> (String, Color32) {
+        if self.cfg.receiver.host.trim().is_empty() {
+            return ("Not set up".into(), theme::WARNING);
+        }
+        match (&self.receiver.result, self.receiver.ok()) {
+            (_, Some(s)) if s.power_on => {
+                let input = s
+                    .input
+                    .as_deref()
+                    .map(|i| format!(" · {}", self.cfg.input_label(i)))
+                    .unwrap_or_default();
+                (format!("On{input}"), theme::SUCCESS)
+            }
+            (_, Some(_)) => ("Standby".into(), theme::WARNING),
+            (Some(Err(_)), _) => ("Unreachable".into(), theme::DANGER),
+            _ => ("Connecting…".into(), theme::TEXT_MUTED),
+        }
+    }
+
+    /// The line above every page: which receiver, whether it's connected
+    /// and on, and save state.
+    fn device_bar(&mut self, ui: &mut egui::Ui) {
+        let mut refresh = false;
+        ui.horizontal(|ui| {
+            ui.set_min_height(30.0);
+            let model = self
+                .receiver
+                .ok()
+                .and_then(|s| s.model.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| self.cfg.receiver.model.clone());
+            let name = if model.is_empty() {
+                "Onkyo receiver".to_string()
+            } else {
+                format!("Onkyo {model}")
+            };
+            let host = self.cfg.receiver.host.trim();
+            let text = if host.is_empty() {
+                name
+            } else {
+                format!("{name}  ·  {host}")
+            };
+            ui.label(
+                RichText::new(text.to_uppercase())
+                    .font(egui::FontId::new(11.5, theme::bold()))
+                    .color(theme::TEXT_DIM)
+                    .extra_letter_spacing(1.4),
+            );
+            ui.add_space(10.0);
+            let (state, color) = self.connection();
+            ui.label(
+                RichText::new(format!("●  {state}"))
+                    .font(egui::FontId::new(12.5, theme::bold()))
+                    .color(color),
+            );
+            let failing = self
+                .monitors
+                .ok()
+                .map(|l| {
+                    l.iter()
+                        .filter(|m| m.ddc && m.current_input.is_none())
+                        .count()
+                })
+                .unwrap_or(0);
+            if failing > 0 {
+                ui.add_space(6.0);
+                theme::status_pill(
+                    ui,
+                    &format!("{failing} monitor(s) not answering"),
+                    theme::WARNING,
+                    theme::WARNING_BORDER,
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(icon::REFRESH).min_size(egui::vec2(30.0, 28.0)))
+                    .on_hover_text("Refresh now")
+                    .clicked()
+                {
+                    refresh = true;
+                }
+                ui.add_space(6.0);
+                if self.dirty() {
                     if theme::button(ui, format!("{}  Revert", icon::UNDO)).clicked() {
                         self.cfg = self.saved.clone();
                         self.selected = self
                             .selected
                             .min(self.cfg.shortcuts.len().saturating_sub(1));
                     }
-                });
-                ui.label(RichText::new("Unsaved changes").color(theme::WARNING));
-            } else {
-                ui.label(
-                    RichText::new(format!("{}  All changes saved", icon::CHECK))
-                        .color(theme::TEXT_MUTED),
-                );
-            }
-            if let Some((msg, error, at)) = &self.status
-                && at.elapsed() < Duration::from_secs(12)
-            {
-                ui.add_space(6.0);
-                let color = if *error {
-                    theme::DANGER
+                    if theme::primary_button(ui, format!("{}  Save", icon::SAVE)).clicked() {
+                        self.save();
+                    }
+                    ui.label(RichText::new("Unsaved changes").color(theme::WARNING));
                 } else {
-                    theme::SUCCESS
-                };
-                ui.add(egui::Label::new(RichText::new(msg).color(color).size(12.5)).wrap());
-            }
+                    ui.label(
+                        RichText::new(format!("{}  All changes saved", icon::CHECK))
+                            .size(12.5)
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+                if let Some((msg, error, at)) = &self.status
+                    && at.elapsed() < Duration::from_secs(12)
+                {
+                    let color = if *error {
+                        theme::DANGER
+                    } else {
+                        theme::SUCCESS
+                    };
+                    ui.add(egui::Label::new(RichText::new(msg).color(color).size(12.5)).truncate());
+                }
+            });
         });
+        if refresh {
+            self.refresh_receiver(ui.ctx());
+            self.scan_monitors(ui.ctx());
+        }
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, st: &ReceiverStatus, cmd: &mut Option<String>) {
@@ -1192,92 +1482,76 @@ impl SettingsApp {
                 .map(|(c, _)| (*c, cfg.input_label(c)))
                 .collect()
         };
-        let power = Some(if st.power_on { "01" } else { "00" });
         const ON_OFF: &[(&str, &str)] = &[("00", "Off"), ("01", "On")];
 
-        egui::Grid::new("controls")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                if cfg.supports("PWR") {
-                    choice_row(
-                        ui,
-                        "Power",
-                        power,
-                        &[("01", "On"), ("00", "Standby")],
-                        "PWR",
-                        cmd,
-                    );
-                }
+        if cfg.supports("SLI") {
+            theme::card(ui, icon::CABLE, "Input", None, |ui| {
+                let width = ui.available_width();
+                input_keys(ui, &cfg, st.input.as_deref(), width, false, cmd);
+            });
+            ui.add_space(12.0);
+        }
 
-                if cfg.supports("MVL") {
-                    ui.label("Volume");
-                    ui.horizontal(|ui| {
-                        if ui.button(" − ").clicked() {
-                            *cmd = Some("MVLDOWN".into());
-                        }
-                        let text = st.volume.map(|v| cfg.volume_text(v)).unwrap_or("?".into());
-                        ui.label(RichText::new(text).strong().monospace());
-                        if ui.button(" + ").clicked() {
-                            *cmd = Some("MVLUP".into());
-                        }
-                        if cfg.supports("AMT")
-                            && theme::choice(ui, "Mute", st.muted == Some(true)).clicked()
-                        {
-                            *cmd = Some("AMTTG".into());
-                        }
-                        ui.separator();
-                        ui.add(
-                            egui::DragValue::new(&mut self.volume_target)
-                                .range(0..=cfg.volume_max()),
+        let volume_target = &mut self.volume_target;
+        theme::columns(ui, 2, |cols| {
+            theme::card(&mut cols[0], icon::POWER, "Power and volume", None, |ui| {
+                controls_grid(ui, "main", |ui| {
+                    if cfg.supports("PWR") {
+                        let power = Some(if st.power_on { "01" } else { "00" });
+                        choice_row(
+                            ui,
+                            "Power",
+                            power,
+                            &[("01", "On"), ("00", "Standby")],
+                            "PWR",
+                            cmd,
                         );
-                        if ui.button("Set").clicked() {
-                            let raw = cfg.volume_raw(self.volume_target);
-                            *cmd = Some(format!("MVL{raw:02X}"));
-                        }
-                    });
-                    ui.end_row();
-                }
-
-                if cfg.supports("SLI") {
-                    ui.label("Input");
-                    // Explicit rows: grid cells mis-measure wrapped layouts.
-                    ui.vertical(|ui| {
-                        for row in inputs("SLI").chunks(7) {
-                            ui.horizontal(|ui| {
-                                for (code, label) in row {
-                                    if theme::choice(
-                                        ui,
-                                        label.clone(),
-                                        st.input.as_deref() == Some(*code),
-                                    )
-                                    .clicked()
-                                    {
-                                        *cmd = Some(format!("SLI{code}"));
-                                    }
-                                }
-                            });
-                        }
-                    });
-                    ui.end_row();
-                }
-
-                if cfg.supports("LMD") {
-                    ui.label("Listening mode");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.set_max_width(480.0);
-                        let steps = [
-                            ("DOWN", "◀"),
-                            ("UP", "▶"),
-                            ("MOVIE", "Movie"),
-                            ("MUSIC", "Music"),
-                            ("GAME", "Game"),
-                        ];
-                        for (code, label) in opts("LMD", &steps) {
-                            if ui.button(label).clicked() {
-                                *cmd = Some(format!("LMD{code}"));
+                    }
+                    if cfg.supports("MVL") {
+                        ui.label(RichText::new("Volume").color(theme::TEXT_SECONDARY));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(egui::Button::new("−").min_size(egui::vec2(30.0, 28.0)))
+                                .clicked()
+                            {
+                                *cmd = Some("MVLDOWN".into());
                             }
-                        }
+                            let text = st.volume.map(|v| cfg.volume_text(v)).unwrap_or("–".into());
+                            ui.add_sized(
+                                [44.0, 28.0],
+                                egui::Label::new(
+                                    RichText::new(text)
+                                        .font(egui::FontId::new(16.0, theme::mono_bold()))
+                                        .color(theme::ACCENT),
+                                ),
+                            );
+                            if ui
+                                .add(egui::Button::new("+").min_size(egui::vec2(30.0, 28.0)))
+                                .clicked()
+                            {
+                                *cmd = Some("MVLUP".into());
+                            }
+                            if cfg.supports("AMT") {
+                                ui.add_space(6.0);
+                                if theme::choice(ui, "Mute", st.muted == Some(true)).clicked() {
+                                    *cmd = Some("AMTTG".into());
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label(RichText::new("Set volume to").color(theme::TEXT_SECONDARY));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(volume_target).range(0..=cfg.volume_max()));
+                            if theme::button(ui, "Set").clicked() {
+                                let raw = cfg.volume_raw(*volume_target);
+                                *cmd = Some(format!("MVL{raw:02X}"));
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    if cfg.supports("LMD") {
+                        ui.label(RichText::new("Listening mode").color(theme::TEXT_SECONDARY));
                         let current = st
                             .listening_mode
                             .as_deref()
@@ -1295,26 +1569,39 @@ impl SettingsApp {
                                     }
                                 }
                             });
-                    });
-                    ui.end_row();
-                }
+                        ui.end_row();
 
-                let rows: [ChoiceRow; 13] = [
-                    (
-                        "HDO",
-                        "HDMI output",
-                        &[("01", "Main"), ("02", "Sub"), ("03", "Main + Sub")],
-                    ),
-                    (
-                        "HAO",
-                        "HDMI audio out",
-                        &[("00", "Off"), ("01", "On"), ("02", "Auto")],
-                    ),
-                    (
-                        "HAS",
-                        "HDMI audio out (sub)",
-                        &[("00", "Off"), ("01", "On")],
-                    ),
+                        let steps = opts(
+                            "LMD",
+                            &[
+                                ("DOWN", "◀"),
+                                ("UP", "▶"),
+                                ("MOVIE", "Movie"),
+                                ("MUSIC", "Music"),
+                                ("GAME", "Game"),
+                            ],
+                        );
+                        if !steps.is_empty() {
+                            ui.label("");
+                            ui.horizontal(|ui| {
+                                for (code, label) in steps {
+                                    if ui.button(label).clicked() {
+                                        *cmd = Some(format!("LMD{code}"));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    }
+                });
+            });
+            settings_card(
+                &mut cols[1],
+                icon::AUDIO_LINES,
+                "Sound",
+                &cfg,
+                st,
+                &[
                     (
                         "SLA",
                         "Audio selector",
@@ -1340,6 +1627,42 @@ impl SettingsApp {
                         "Late night",
                         &[("00", "Off"), ("01", "Low"), ("02", "High"), ("03", "Auto")],
                     ),
+                ],
+                cmd,
+            );
+        });
+        ui.add_space(12.0);
+
+        theme::columns(ui, 2, |cols| {
+            settings_card(
+                &mut cols[0],
+                icon::HDMI,
+                "HDMI",
+                &cfg,
+                st,
+                &[
+                    (
+                        "HDO",
+                        "Output",
+                        &[("01", "Main"), ("02", "Sub"), ("03", "Main + Sub")],
+                    ),
+                    (
+                        "HAO",
+                        "Audio out",
+                        &[("00", "Off"), ("01", "On"), ("02", "Auto")],
+                    ),
+                    ("HAS", "Audio out (sub)", &[("00", "Off"), ("01", "On")]),
+                    ("CEC", "HDMI CEC", ON_OFF),
+                ],
+                cmd,
+            );
+            settings_card(
+                &mut cols[1],
+                icon::SETTINGS,
+                "System",
+                &cfg,
+                st,
+                &[
                     (
                         "DIM",
                         "Display",
@@ -1360,260 +1683,360 @@ impl SettingsApp {
                             ("5A", "90 min"),
                         ],
                     ),
-                    ("CEC", "HDMI CEC", ON_OFF),
-                    ("TGA", "12V trigger A", ON_OFF),
-                    ("TGB", "12V trigger B", ON_OFF),
-                    ("TGC", "12V trigger C", ON_OFF),
-                ];
-                for (group, label, options) in rows {
-                    if !cfg.supports(group) {
-                        continue;
-                    }
-                    let current = if group == "HDO" {
-                        st.hdmi_output.as_deref()
-                    } else {
-                        extra(group)
-                    };
-                    choice_row(ui, label, current, &opts(group, options), group, cmd);
-                }
+                    ("TGA", "12 V trigger A", ON_OFF),
+                    ("TGB", "12 V trigger B", ON_OFF),
+                    ("TGC", "12 V trigger C", ON_OFF),
+                ],
+                cmd,
+            );
+        });
 
-                // Zones: power, volume, mute and input on one row each.
-                for (label, pwr, vol, mute, sel) in [
-                    ("Zone 2", "ZPW", "ZVL", "ZMT", "SLZ"),
-                    ("Zone 3", "PW3", "VL3", "MT3", "SL3"),
-                ] {
-                    if !cfg.supports(pwr) {
-                        continue;
-                    }
-                    ui.label(label);
-                    ui.horizontal(|ui| {
-                        for (code, text) in [("01", "On"), ("00", "Standby")] {
-                            if theme::choice(ui, text, extra(pwr) == Some(code)).clicked() {
-                                *cmd = Some(format!("{pwr}{code}"));
-                            }
-                        }
-                        if cfg.supports(vol) {
-                            ui.separator();
-                            if ui.button(" − ").clicked() {
-                                *cmd = Some(format!("{vol}DOWN"));
-                            }
-                            let v = extra(vol)
-                                .and_then(|v| u8::from_str_radix(v, 16).ok())
-                                .map(|v| v.to_string())
-                                .unwrap_or("–".into());
-                            ui.label(RichText::new(v).monospace());
-                            if ui.button(" + ").clicked() {
-                                *cmd = Some(format!("{vol}UP"));
-                            }
-                        }
-                        if cfg.supports(mute)
-                            && theme::choice(ui, "Mute", extra(mute) == Some("01")).clicked()
-                        {
-                            *cmd = Some(format!("{mute}TG"));
-                        }
-                        if cfg.supports(sel) {
-                            let name = |c: &str| {
-                                if c == "80" {
-                                    "Same as main".to_string()
-                                } else {
-                                    cfg.input_label(c)
-                                }
-                            };
-                            let current = extra(sel).map(name).unwrap_or_else(|| "Input…".into());
-                            egui::ComboBox::from_id_salt(("ctl_zone", sel))
-                                .selected_text(current)
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    if cfg.supports_value(sel, "80")
-                                        && ui
-                                            .selectable_label(
-                                                extra(sel) == Some("80"),
-                                                "Same as main",
-                                            )
-                                            .clicked()
+        // Zones: one card each, side by side.
+        let zones: Vec<(&str, &str, &str, &str, &str)> = [
+            ("Zone 2", "ZPW", "ZVL", "ZMT", "SLZ"),
+            ("Zone 3", "PW3", "VL3", "MT3", "SL3"),
+        ]
+        .into_iter()
+        .filter(|z| cfg.supports(z.1))
+        .collect();
+        if !zones.is_empty() {
+            theme::columns(ui, 2, |cols| {
+                for (ui, (label, pwr, vol, mute, sel)) in cols.iter_mut().zip(&zones) {
+                    theme::card(ui, icon::HOUSE, label, None, |ui| {
+                        controls_grid(ui, label, |ui| {
+                            choice_row(
+                                ui,
+                                "Power",
+                                extra(pwr),
+                                &[("01", "On"), ("00", "Standby")],
+                                pwr,
+                                cmd,
+                            );
+                            if cfg.supports(vol) {
+                                ui.label(RichText::new("Volume").color(theme::TEXT_SECONDARY));
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new("−").min_size(egui::vec2(30.0, 28.0)),
+                                        )
+                                        .clicked()
                                     {
-                                        *cmd = Some(format!("{sel}80"));
+                                        *cmd = Some(format!("{vol}DOWN"));
                                     }
-                                    for (code, label) in inputs(sel) {
-                                        if ui
-                                            .selectable_label(extra(sel) == Some(code), label)
+                                    let v = extra(vol)
+                                        .and_then(|v| u8::from_str_radix(v, 16).ok())
+                                        .map(|v| v.to_string())
+                                        .unwrap_or("–".into());
+                                    ui.add_sized(
+                                        [44.0, 28.0],
+                                        egui::Label::new(
+                                            RichText::new(v)
+                                                .font(egui::FontId::new(16.0, theme::mono_bold()))
+                                                .color(theme::ACCENT),
+                                        ),
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::Button::new("+").min_size(egui::vec2(30.0, 28.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        *cmd = Some(format!("{vol}UP"));
+                                    }
+                                    if cfg.supports(mute) {
+                                        ui.add_space(6.0);
+                                        if theme::choice(ui, "Mute", extra(mute) == Some("01"))
                                             .clicked()
                                         {
-                                            *cmd = Some(format!("{sel}{code}"));
+                                            *cmd = Some(format!("{mute}TG"));
                                         }
                                     }
                                 });
-                        }
+                                ui.end_row();
+                            }
+                            if cfg.supports(sel) {
+                                ui.label(RichText::new("Input").color(theme::TEXT_SECONDARY));
+                                let name = |c: &str| {
+                                    if c == "80" {
+                                        "Same as main".to_string()
+                                    } else {
+                                        cfg.input_label(c)
+                                    }
+                                };
+                                let current =
+                                    extra(sel).map(name).unwrap_or_else(|| "Input…".into());
+                                egui::ComboBox::from_id_salt(("ctl_zone", *sel))
+                                    .selected_text(current)
+                                    .width(170.0)
+                                    .show_ui(ui, |ui| {
+                                        if cfg.supports_value(sel, "80")
+                                            && ui
+                                                .selectable_label(
+                                                    extra(sel) == Some("80"),
+                                                    "Same as main",
+                                                )
+                                                .clicked()
+                                        {
+                                            *cmd = Some(format!("{sel}80"));
+                                        }
+                                        for (code, label) in inputs(sel) {
+                                            if ui
+                                                .selectable_label(extra(sel) == Some(code), label)
+                                                .clicked()
+                                            {
+                                                *cmd = Some(format!("{sel}{code}"));
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+                            }
+                        });
                     });
-                    ui.end_row();
                 }
+            });
+            ui.add_space(12.0);
+        }
 
-                ui.label("Raw command");
+        theme::card(
+            ui,
+            icon::ZAP,
+            "Raw command",
+            Some("Any eISCP command, for anything not covered above."),
+            |ui| {
                 ui.horizontal(|ui| {
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.raw_command)
                             .hint_text("e.g. LMD0C")
-                            .desired_width(140.0)
-                            .font(egui::TextStyle::Monospace),
+                            .desired_width(160.0)
+                            .margin(egui::vec2(8.0, 6.0))
+                            .font(egui::FontId::new(13.0, theme::mono())),
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (ui.button("Send").clicked() || enter) && !self.raw_command.trim().is_empty()
+                    if (theme::button(ui, "Send").clicked() || enter)
+                        && !self.raw_command.trim().is_empty()
                     {
                         *cmd = Some(self.raw_command.trim().to_ascii_uppercase());
                     }
+                    if !self.last_command.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(&self.last_command)
+                                .font(egui::FontId::new(12.5, theme::mono()))
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
                 });
-                ui.end_row();
-            });
+            },
+        );
     }
 
     /// The "Receiver settings…" window: one-time setup that rarely changes.
+    /// The Receiver tab's Setup view: one-time setup that rarely changes.
     fn receiver_settings_ui(&mut self, ui: &mut egui::Ui) {
-        theme::subheading(ui, icon::VOLUME, "Volume");
-        egui::Grid::new("rs_volume")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Volume steps");
-                ui.checkbox(
-                    &mut self.cfg.receiver.volume_half_steps,
-                    "0.5 steps (receiver shows e.g. 25.5)",
-                )
-                .on_hover_text(
-                    "Turn on only if the receiver's front panel shows half steps \
-                     (e.g. 25.5). Most models, including the DTR-50.7, show whole numbers.",
-                );
-                ui.end_row();
-
-                ui.label("Full-scale volume").on_hover_text(
-                    "The volume (as shown on the receiver) that fills the on-screen volume bar.",
-                );
-                ui.add(egui::DragValue::new(&mut self.cfg.receiver.max_volume).range(1..=200));
-                ui.end_row();
-            });
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            theme::subheading(ui, icon::LAYERS, "Supported features");
-            let can = !self.cfg.receiver.host.trim().is_empty() && !self.probe.running();
-            if ui
-                .add_enabled(can, egui::Button::new("Detect again"))
-                .clicked()
-            {
-                self.start_probe(ui.ctx());
-            }
-            if self.probe.running() {
-                ui.add(egui::Spinner::new());
-                ui.label("Asking the receiver (takes a few seconds)…");
-            }
-        });
-        ui.label("Detected automatically the first time the receiver is reached, and saved.");
-        if let Some(t) = self.cfg.model_table() {
-            ui.weak(format!(
-                "Onkyo {} is in the protocol spreadsheet ({}): {} commands, \
-                 with the exact options per command.",
-                self.cfg.receiver.model,
-                crate::models::source(),
-                t.len()
-            ));
-        } else if !self.cfg.receiver.features_source.is_empty() {
-            ui.weak(format!("Source: {}", self.cfg.receiver.features_source));
-        }
-        if let Some(Err(e)) = &self.probe.result {
-            ui.colored_label(err_color(ui), format!("Detection failed: {e}"));
-        }
-        let features = self.cfg.effective_features();
-        if features.is_empty() {
-            ui.label("Not detected yet.");
-        } else {
-            egui::Grid::new("features")
-                .num_columns(4)
-                .spacing([24.0, 2.0])
-                .show(ui, |ui| {
-                    let mut col = 0;
-                    for (group, label) in eiscp::FEATURES {
-                        let Some(ok) = features.get(*group) else {
-                            continue;
-                        };
-                        let (text, color) = if *ok {
-                            ("yes", ok_color(ui))
-                        } else {
-                            ("no", ui.visuals().weak_text_color())
-                        };
-                        ui.label(*label).on_hover_text(format!("{group}QSTN"));
-                        ui.colored_label(color, text);
-                        col += 1;
-                        if col % 2 == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
-        }
-
-        ui.add_space(12.0);
-        theme::subheading(ui, icon::HDMI, "Inputs");
-        ui.label(if self.cfg.receiver.features.get("NRI") == Some(&true) {
-            "Only the inputs the receiver reported are ticked. Untick any you don't want in \
-             the shortcut editor and control panel, and rename them if you like."
-        } else {
-            "This receiver doesn't report its inputs, so all known inputs are listed. \
-             Rename the ones you use and untick the rest."
-        });
-        ui.add_space(4.0);
-        let current_input = self.receiver.ok().and_then(|s| s.input.clone());
-        egui::Grid::new("inputs")
-            .num_columns(4)
-            .striped(true)
-            .spacing([12.0, 4.0])
-            .show(ui, |ui| {
-                ui.strong("Show");
-                ui.strong("Code");
-                ui.strong("Default name");
-                ui.strong("Your label");
-                ui.end_row();
-                for (code, default) in eiscp::INPUTS {
-                    let mut shown = !self.cfg.receiver.hidden_inputs.iter().any(|c| c == code);
-                    if ui.checkbox(&mut shown, "").changed() {
-                        if shown {
-                            self.cfg.receiver.hidden_inputs.retain(|c| c != code);
-                        } else {
-                            self.cfg.receiver.hidden_inputs.push(code.to_string());
-                        }
-                    }
-                    let active = current_input.as_deref() == Some(*code);
-                    let code_text = RichText::new(*code).monospace();
-                    ui.label(if active {
-                        code_text.strong().color(ok_color(ui))
-                    } else {
-                        code_text
-                    });
-                    ui.label(if active {
-                        format!("{default}  (active)")
-                    } else {
-                        default.to_string()
-                    });
-                    let mut label = self
-                        .cfg
-                        .receiver
-                        .input_names
-                        .get(*code)
-                        .cloned()
-                        .unwrap_or_default();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut label).desired_width(160.0))
-                        .changed()
+        theme::card(
+            ui,
+            icon::VOLUME,
+            "Volume",
+            Some("How the receiver counts volume."),
+            |ui| {
+                controls_grid(ui, "rs_volume", |ui| {
+                    ui.label(RichText::new("Volume steps").color(theme::TEXT_SECONDARY));
+                    let mut half = usize::from(self.cfg.receiver.volume_half_steps);
+                    if let Some(i) =
+                        theme::segmented(ui, "rs_steps", &["Whole (25)", "Half (25.5)"], Some(half))
                     {
-                        if label.is_empty() {
-                            self.cfg.receiver.input_names.remove(*code);
-                        } else {
-                            self.cfg
-                                .receiver
-                                .input_names
-                                .insert(code.to_string(), label);
-                        }
+                        half = i;
+                        self.cfg.receiver.volume_half_steps = half == 1;
                     }
                     ui.end_row();
-                }
-            });
+
+                    ui.label(RichText::new("Full-scale volume").color(theme::TEXT_SECONDARY))
+                        .on_hover_text(
+                            "The volume (as shown on the receiver) that fills the volume bar.",
+                        );
+                    ui.add(egui::DragValue::new(&mut self.cfg.receiver.max_volume).range(1..=200));
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Use half steps only if the receiver's front panel shows them \
+                                 (e.g. 25.5).",
+                        )
+                        .size(12.5)
+                        .color(theme::TEXT_DIM),
+                    )
+                    .wrap(),
+                );
+            },
+        );
+
+        ui.add_space(12.0);
+
+        // Features and inputs side by side.
+        theme::columns(ui, 2, |cols| {
+            let can = !self.cfg.receiver.host.trim().is_empty() && !self.probe.running();
+            let mut detect = false;
+            theme::card_with(
+                &mut cols[0],
+                icon::LAYERS,
+                "Supported features",
+                Some("Detected the first time the receiver is reached, and saved."),
+                |ui| {
+                    if ui
+                        .add_enabled(can, egui::Button::new("Detect again"))
+                        .clicked()
+                    {
+                        detect = true;
+                    }
+                    if self.probe.running() {
+                        ui.add(egui::Spinner::new());
+                    }
+                },
+                |ui| {
+                    if let Some(t) = self.cfg.model_table() {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Onkyo {} is in the protocol spreadsheet ({}): {} commands, \
+                                     with the exact options per command.",
+                                    self.cfg.receiver.model,
+                                    crate::models::source(),
+                                    t.len()
+                                ))
+                                .size(12.5)
+                                .color(theme::TEXT_DIM),
+                            )
+                            .wrap(),
+                        );
+                    } else if !self.cfg.receiver.features_source.is_empty() {
+                        ui.label(
+                            RichText::new(format!("Source: {}", self.cfg.receiver.features_source))
+                                .size(12.5)
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
+                    if self.probe.running() {
+                        ui.label("Asking the receiver (takes a few seconds)…");
+                    }
+                    if let Some(Err(e)) = &self.probe.result {
+                        ui.colored_label(theme::DANGER, format!("Detection failed: {e}"));
+                    }
+                    ui.add_space(6.0);
+                    let features = self.cfg.effective_features();
+                    if features.is_empty() {
+                        ui.label("Not detected yet.");
+                        return;
+                    }
+                    egui::Grid::new("features")
+                        .num_columns(4)
+                        .spacing([18.0, 4.0])
+                        .show(ui, |ui| {
+                            let mut col = 0;
+                            for (group, label) in eiscp::FEATURES {
+                                let Some(ok) = features.get(*group) else {
+                                    continue;
+                                };
+                                ui.label(
+                                    RichText::new(*label)
+                                        .size(12.5)
+                                        .color(theme::TEXT_SECONDARY),
+                                )
+                                .on_hover_text(format!("{group}QSTN"));
+                                ui.label(
+                                    RichText::new(if *ok { "yes" } else { "no" })
+                                        .font(egui::FontId::new(12.0, theme::mono()))
+                                        .color(if *ok { theme::SUCCESS } else { theme::TEXT_DIM }),
+                                );
+                                col += 1;
+                                if col % 2 == 0 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                },
+            );
+            if detect {
+                self.start_probe(cols[0].ctx());
+            }
+
+            let current_input = self.receiver.ok().and_then(|s| s.input.clone());
+            let reported = self.cfg.receiver.features.get("NRI") == Some(&true);
+            theme::card(
+                &mut cols[1],
+                icon::CABLE,
+                "Inputs",
+                Some(if reported {
+                    "Only the inputs the receiver reported are ticked. Untick any you don't want, and rename them if you like."
+                } else {
+                    "This receiver doesn't report its inputs, so all known inputs are listed. Rename the ones you use and untick the rest."
+                }),
+                |ui| {
+                    egui::Grid::new("inputs")
+                        .num_columns(4)
+                        .spacing([16.0, 6.0])
+                        .show(ui, |ui| {
+                            for h in ["Show", "Code", "Default name", "Your label"] {
+                                theme::section_label(ui, h);
+                            }
+                            ui.end_row();
+                            for (code, default) in eiscp::INPUTS {
+                                let mut shown =
+                                    !self.cfg.receiver.hidden_inputs.iter().any(|c| c == code);
+                                if ui.checkbox(&mut shown, "").changed() {
+                                    if shown {
+                                        self.cfg.receiver.hidden_inputs.retain(|c| c != code);
+                                    } else {
+                                        self.cfg.receiver.hidden_inputs.push(code.to_string());
+                                    }
+                                }
+                                let active = current_input.as_deref() == Some(*code);
+                                ui.label(
+                                    RichText::new(*code)
+                                        .font(egui::FontId::new(12.5, theme::mono()))
+                                        .color(if active {
+                                            theme::ACCENT
+                                        } else {
+                                            theme::TEXT_DIM
+                                        }),
+                                );
+                                ui.label(if active {
+                                    RichText::new(format!("{default}  (active)"))
+                                        .color(theme::ACCENT)
+                                } else {
+                                    RichText::new(*default).color(theme::TEXT_SECONDARY)
+                                });
+                                let mut label = self
+                                    .cfg
+                                    .receiver
+                                    .input_names
+                                    .get(*code)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut label)
+                                            .desired_width(120.0)
+                                            .hint_text(*default),
+                                    )
+                                    .changed()
+                                {
+                                    if label.is_empty() {
+                                        self.cfg.receiver.input_names.remove(*code);
+                                    } else {
+                                        self.cfg
+                                            .receiver
+                                            .input_names
+                                            .insert(code.to_string(), label);
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                },
+            );
+        });
     }
 
     fn monitors_tab(&mut self, ui: &mut egui::Ui) {
@@ -1622,7 +2045,7 @@ impl SettingsApp {
         theme::page_header(
             ui,
             "Monitors",
-            "Connected displays and their inputs. Click an input to switch to it now.",
+            "Everything the connected displays report. Switch inputs from the Status page.",
             |ui| {
                 if ui
                     .add_enabled(
@@ -1669,73 +2092,27 @@ impl SettingsApp {
                 RichText::new("No monitors with DDC/CI input switching found. DDC/CI may need turning on in the monitor's own menu.")
                     .color(theme::TEXT_MUTED),
             );
+            return;
         }
-        let busy = self.monitor_test.running();
-        let mut test: Option<(MonitorId, u8)> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let per_row = list.len().clamp(2, 3);
-            for pair in list.chunks(per_row) {
-                theme::columns(ui, per_row, |cols| {
-                    for (ui, m) in cols.iter_mut().zip(pair) {
-                        let subtitle = format!("{}  ·  {}", m.id.mfg, m.connector);
-                        theme::card(
-                            ui,
-                            if m.ddc { icon::MONITOR } else { icon::SPEAKER },
-                            &m.id.model,
-                            Some(&subtitle),
-                            |ui| {
-                                if !m.ddc {
-                                    let note = if m.id.mfg == "ONK" {
-                                        "This is your Onkyo receiver's HDMI link. It doesn't do DDC/CI; the receiver is controlled over the network instead."
-                                    } else {
-                                        "DDC/CI is not supported or is turned off in the monitor's menu, so inputs can't be switched."
-                                    };
-                                    ui.add(egui::Label::new(RichText::new(note).color(theme::TEXT_MUTED)).wrap());
-                                    return;
-                                }
-                                theme::kv(
-                                    ui,
-                                    "Current input",
-                                    m.current_input
-                                        .map(monitors::input_name)
-                                        .unwrap_or_else(|| "No answer".into()),
-                                );
-                                theme::kv(ui, "Input signal", signal_text(m));
-                                if let Some(d) = &m.mode {
-                                    theme::kv(ui, "PC output", format!("{} @ {}", d.resolution(), d.refresh()));
-                                }
-                                ui.add_space(6.0);
-                                ui.label(RichText::new("Switch to").color(theme::TEXT_SECONDARY));
-                                ui.horizontal_wrapped(|ui| {
-                                    for code in monitors::selectable_inputs(Some(m)) {
-                                        let current = m.current_input == Some(code);
-                                        if ui
-                                            .add_enabled_ui(!busy, |ui| {
-                                                theme::choice(ui, monitors::input_name(code), current)
-                                            })
-                                            .inner
-                                            .clicked()
-                                        {
-                                            test = Some((m.id.clone(), code));
-                                        }
-                                    }
-                                });
-                                if let Some(e) = &m.error {
-                                    ui.colored_label(theme::WARNING, e);
-                                }
-                            },
-                        );
+            // Keeps cards clear of the floating scrollbar.
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    right: 14,
+                    ..Default::default()
+                })
+                .show(ui, |ui| {
+                    let per_row = list.len().clamp(2, 3);
+                    for row in list.chunks(per_row) {
+                        theme::columns(ui, per_row, |cols| {
+                            for (col, m) in cols.iter_mut().zip(row) {
+                                monitor_card(col, m);
+                            }
+                        });
+                        ui.add_space(12.0);
                     }
                 });
-                ui.add_space(12.0);
-            }
         });
-
-        if let Some((id, code)) = test {
-            let ctx = ui.ctx().clone();
-            self.monitor_test
-                .start(&ctx, move || monitors::set_input(&id, code));
-        }
     }
 
     fn shortcuts_tab(&mut self, ui: &mut egui::Ui) {
@@ -2541,75 +2918,72 @@ impl eframe::App for SettingsApp {
         }
         ui.ctx().request_repaint_after(Duration::from_secs(2));
 
-        egui::Panel::left("sidebar")
-            .exact_size(260.0)
+        egui::Panel::left("rail")
+            .exact_size(64.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::SIDEBAR)
-                    .inner_margin(egui::Margin::symmetric(18, 18))
-                    .stroke(egui::Stroke::new(1.0, theme::DIVIDER)),
+                    .inner_margin(egui::Margin::symmetric(0, 16))
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
             )
-            .show(ui, |ui| self.sidebar(ui));
+            .show(ui, |ui| self.rail(ui));
+
+        egui::Panel::top("device_bar")
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin {
+                        left: 26,
+                        right: 26,
+                        top: 14,
+                        bottom: 0,
+                    }),
+            )
+            .show(ui, |ui| self.device_bar(ui));
 
         egui::CentralPanel::no_frame()
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(28, 22)),
+                    .inner_margin(egui::Margin {
+                        left: 26,
+                        right: 26,
+                        top: 12,
+                        bottom: 20,
+                    }),
             )
             .show(ui, |ui| match self.tab {
+                // The right margin keeps content clear of the floating scrollbar.
                 Tab::Status => {
                     egui::ScrollArea::vertical()
                         .id_salt("status_page")
-                        .show(ui, |ui| self.status_page(ui));
+                        .show(ui, |ui| {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    right: 14,
+                                    ..Default::default()
+                                })
+                                .show(ui, |ui| self.status_page(ui));
+                        });
                 }
                 Tab::Receiver => {
                     egui::ScrollArea::vertical()
                         .id_salt("receiver_tab")
-                        .show(ui, |ui| self.receiver_tab(ui));
+                        .show(ui, |ui| {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    right: 14,
+                                    ..Default::default()
+                                })
+                                .show(ui, |ui| self.receiver_tab(ui));
+                        });
                 }
                 Tab::Monitors => self.monitors_tab(ui),
                 Tab::Shortcuts => self.shortcuts_tab(ui),
                 Tab::General => self.general_tab(ui),
             });
-
-        if self.show_receiver_settings {
-            let ctx = ui.ctx().clone();
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("receiver_settings"),
-                egui::ViewportBuilder::default()
-                    .with_title("Receiver settings")
-                    .with_app_id(crate::config::APP_ID)
-                    .with_inner_size([640.0, 700.0]),
-                |ui, _class| {
-                    egui::Panel::bottom("rs_actions").show(ui, |ui| {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(self.dirty(), egui::Button::new("Save"))
-                                .clicked()
-                            {
-                                self.save();
-                            }
-                            if ui.button("Close").clicked() {
-                                self.show_receiver_settings = false;
-                            }
-                            if self.dirty() {
-                                ui.weak("Unsaved changes");
-                            }
-                        });
-                        ui.add_space(2.0);
-                    });
-                    egui::CentralPanel::default_margins().show(ui, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| self.receiver_settings_ui(ui));
-                    });
-                    if ui.ctx().input(|i| i.viewport().close_requested()) {
-                        self.show_receiver_settings = false;
-                    }
-                },
-            );
-        }
     }
 }
 

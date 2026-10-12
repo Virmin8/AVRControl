@@ -1,4 +1,5 @@
 Third-party assets in assets/fonts are under their own licences: Inter
-(SIL Open Font License 1.1, see LICENSE-inter.txt) and Lucide icons (ISC, see
+(SIL Open Font License 1.1, see LICENSE-inter.txt), JetBrains Mono (SIL Open
+Font License 1.1, see LICENSE-jetbrains-mono.txt) and Lucide icons (ISC, see
 LICENSE-lucide.txt). tools/import_protocol_doc.py is adapted from
 onkyo-eiscp (MIT, https://github.com/miracle2k/onkyo-eiscp).
