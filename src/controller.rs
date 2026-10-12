@@ -54,6 +54,9 @@ pub struct Hooks {
 
 pub struct Controller {
     cfg: Config,
+    /// True while the startup shortcut runs: monitors already on their
+    /// target input are left alone instead of being switched again.
+    starting: bool,
     receiver: Receiver,
     feedback: Feedback,
     hooks: Hooks,
@@ -77,6 +80,7 @@ fn parse_volume(reply: &str) -> Option<u8> {
 impl Controller {
     pub fn new(cfg: Config, hooks: Hooks) -> Self {
         Self {
+            starting: false,
             receiver: {
                 let mut r = Receiver::new(&cfg.receiver.host, cfg.receiver.port);
                 r.set_features(&cfg.effective_features());
@@ -98,7 +102,9 @@ impl Controller {
             self.connect();
             let startup = self.cfg.general.startup_shortcut.clone();
             if !startup.is_empty() {
+                self.starting = true;
                 self.trigger(&startup);
+                self.starting = false;
             }
         } else {
             self.feedback
@@ -477,8 +483,21 @@ impl Controller {
         };
         // Monitors are switched on a separate thread so DDC/CI latency
         // overlaps with the network round-trips to the receiver.
-        let targets = targets.to_vec();
+        let mut targets = targets.to_vec();
+        let starting = self.starting;
         let monitor_job = thread::spawn(move || {
+            if starting && !targets.is_empty() {
+                // At startup, leave monitors that are already on their input:
+                // re-selecting it can blank the screen for a moment. If the
+                // inputs can't be read, switch as usual.
+                if let Ok(current) = monitors::current_inputs() {
+                    targets.retain(|t| {
+                        !current
+                            .iter()
+                            .any(|(id, _, input)| id == &t.monitor && *input == Some(t.input))
+                    });
+                }
+            }
             targets
                 .iter()
                 .filter_map(|t| {
