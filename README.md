@@ -28,7 +28,10 @@ hotkeys. It runs in the system tray on Linux (Wayland and X11) and Windows.
 - Knows exactly which commands and values each model supports, from Onkyo's
   protocol spreadsheet (252 models). Other models are probed on first
   connection.
-- Control panel for testing every supported function without a shortcut.
+- Controls for every supported function without a shortcut, grouped into
+  power and volume, sound, HDMI, system and zones.
+- Optionally turns the receiver off when the PC shuts down, if it's still on
+  the startup input.
 - Works with receivers that allow only one network client: the settings
   window and command line share the background service's connection.
 
@@ -56,6 +59,8 @@ hotkeys. It runs in the system tray on Linux (Wayland and X11) and Windows.
   (KDE Plasma, GNOME 48+); the tray uses StatusNotifierItem.
 - Windows: tray icon and `RegisterHotKey` hotkeys.
 - Start on login, a systemd user unit, and an Arch package (PKGBUILD).
+- Checks for new releases and, for the Windows installer and the AppImage,
+  updates itself (see [Updates](#updates)).
 
 ## Settings window
 
@@ -78,7 +83,7 @@ The configuration is stored in `~/.config/avrcontrol/config.toml` (Linux) or
 ```
 avrcontrol                 start in the background (opens settings if already running)
 avrcontrol daemon          start the background service
-avrcontrol settings [TAB]  open settings (receiver|monitors|shortcuts|general)
+avrcontrol settings [TAB]  open settings (status|receiver|monitors|shortcuts|general)
 avrcontrol trigger <ID>    run a shortcut in the running instance
 avrcontrol list            list shortcuts and their IDs
 avrcontrol monitors        list monitors, connectors and inputs
@@ -97,6 +102,8 @@ Every [release](https://github.com/Virmin8/AVRControl/releases) has:
 | `avrcontrol-<version>-windows-x64.exe` | Windows, portable: run it from anywhere |
 | `avrcontrol-<version>-1-x86_64.pkg.tar.zst` | Arch Linux and derivatives |
 | `avrcontrol-<version>-x86_64.AppImage` | Other Linux distributions |
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 ### Updates
 

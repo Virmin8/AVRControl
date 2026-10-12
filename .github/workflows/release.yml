@@ -109,6 +109,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          # The lines between this version's "## [x.y.z]" heading and the next one.
+          awk -v v="[$version]" '/^## \[/ { p = index($0, v) > 0; next } /^\[/ { p = 0 } p' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $version"; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -116,4 +123,4 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: notes.md
