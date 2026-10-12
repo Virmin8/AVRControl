@@ -3,6 +3,12 @@
 All notable changes to AVR Control. Versions follow
 [semantic versioning](https://semver.org); each heading links to its release.
 
+## [1.2.1] - 2026-10-12
+
+### Changed
+- At startup, monitors that are already on the startup shortcut's input are
+  left alone instead of being switched to it again.
+
 ## [1.2.0] - 2026-10-12
 
 ### Changed
@@ -93,6 +99,7 @@ First release.
   left-click on the tray icon opening Settings, and monitors that ignore
   DDC/CI for a few seconds while switching inputs.
 
+[1.2.1]: https://github.com/Virmin8/AVRControl/releases/tag/v1.2.1
 [1.2.0]: https://github.com/Virmin8/AVRControl/releases/tag/v1.2.0
 [1.1.2]: https://github.com/Virmin8/AVRControl/releases/tag/v1.1.2
 [1.1.1]: https://github.com/Virmin8/AVRControl/releases/tag/v1.1.1
