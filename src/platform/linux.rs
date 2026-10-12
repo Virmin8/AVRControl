@@ -19,6 +19,7 @@ use crate::hotkey::Hotkey;
 enum Msg {
     Rebind(Config),
     Status(String),
+    Update(Option<String>),
     ConfigureShortcuts,
     Quit,
 }
@@ -38,6 +39,8 @@ struct Tray {
     shortcuts: Vec<(String, String)>,
     /// Receiver status summary shown in the tooltip.
     status: String,
+    /// Label of the update entry, when a release is available.
+    update: Option<String>,
 }
 
 impl ksni::Tray for Tray {
@@ -92,6 +95,17 @@ impl ksni::Tray for Tray {
             })
             .collect();
         items.push(MenuItem::Separator);
+        if let Some(label) = &self.update {
+            items.push(
+                StandardItem {
+                    label: label.clone(),
+                    icon_name: "system-software-update".into(),
+                    activate: Box::new(|_: &mut Self| crate::update::activate()),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.push(
             StandardItem {
                 label: "Settings…".into(),
@@ -264,6 +278,7 @@ pub fn run(
 
         let reload_tx = ptx.clone();
         let status_tx = ptx.clone();
+        let update_tx = ptx.clone();
         let quit_tx = ptx;
         start(
             cfg.clone(),
@@ -276,6 +291,9 @@ pub fn run(
                 }),
                 on_status: std::sync::Arc::new(move |text| {
                     let _ = status_tx.send(Msg::Status(text));
+                }),
+                on_update: std::sync::Arc::new(move |label| {
+                    let _ = update_tx.send(Msg::Update(label));
                 }),
             },
         );
@@ -290,6 +308,7 @@ pub fn run(
             tx: tx.clone(),
             shortcuts: menu_entries(&cfg),
             status: String::new(),
+            update: None,
         };
         let tray = match tray.spawn().await {
             Ok(h) => Some(h),
@@ -315,6 +334,11 @@ pub fn run(
                 Msg::Status(text) => {
                     if let Some(t) = &tray {
                         t.update(move |t| t.status = text).await;
+                    }
+                }
+                Msg::Update(label) => {
+                    if let Some(t) = &tray {
+                        t.update(move |t| t.update = label).await;
                     }
                 }
                 Msg::ConfigureShortcuts => {

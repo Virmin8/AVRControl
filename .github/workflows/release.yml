@@ -21,6 +21,11 @@ jobs:
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version /DOutputDir=..\..\dist packaging\windows\avrcontrol.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item target\release\avrcontrol.exe "dist\avrcontrol-$version-windows-x64.exe"
+          # The in-app updater checks the installer against this before running it.
+          Get-ChildItem dist\*.exe | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            [IO.File]::WriteAllText("$($_.FullName).sha256", "$hash  $($_.Name)`n")
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -57,6 +62,8 @@ jobs:
           chmod +x appimagetool
           mkdir -p dist
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool AppDir dist/avrcontrol-$version-x86_64.AppImage
+          # The in-app updater checks the download against this before swapping it in.
+          (cd dist && sha256sum avrcontrol-$version-x86_64.AppImage > avrcontrol-$version-x86_64.AppImage.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: appimage
@@ -83,6 +90,14 @@ jobs:
           su - builder -c "cd '$PWD' && makepkg -sf --noconfirm"
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp ./*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
+          # A one-package pacman repo ("[avrcontrol]" in pacman.conf) whose Server
+          # is releases/latest/download, so `pacman -Syu` picks up new releases.
+          # repo-add makes .db/.files as symlinks; release assets must be files.
+          cd "$GITHUB_WORKSPACE/dist"
+          mkdir -p /tmp/repo
+          repo-add /tmp/repo/avrcontrol.db.tar.gz ./*.pkg.tar.zst
+          cp -L /tmp/repo/avrcontrol.db /tmp/repo/avrcontrol.files .
+          ls -l
       - uses: actions/upload-artifact@v4
         with:
           name: arch

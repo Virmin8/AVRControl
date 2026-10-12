@@ -19,21 +19,26 @@ use crate::controller::{Event, Hooks};
 const WM_APP_RELOAD: u32 = WM_APP + 1;
 const WM_APP_QUIT: u32 = WM_APP + 2;
 const WM_APP_STATUS: u32 = WM_APP + 3;
+const WM_APP_UPDATE: u32 = WM_APP + 4;
 
 const MENU_SETTINGS: &str = "__settings";
 const MENU_RECONNECT: &str = "__reconnect";
 const MENU_QUIT: &str = "__quit";
+const MENU_UPDATE: &str = "__update";
 
 pub fn configure_shortcuts() -> Result<()> {
     bail!("hotkeys are configured in AVR Control's settings on Windows")
 }
 
-fn build_menu(cfg: &Config) -> Menu {
+fn build_menu(cfg: &Config, update: Option<&str>) -> Menu {
     let menu = Menu::new();
     for s in &cfg.shortcuts {
         let _ = menu.append(&MenuItem::with_id(s.id.as_str(), &s.name, true, None));
     }
     let _ = menu.append(&PredefinedMenuItem::separator());
+    if let Some(label) = update {
+        let _ = menu.append(&MenuItem::with_id(MENU_UPDATE, label, true, None));
+    }
     let _ = menu.append(&MenuItem::with_id(MENU_SETTINGS, "Settings…", true, None));
     let _ = menu.append(&MenuItem::with_id(MENU_RECONNECT, "Reconnect", true, None));
     let _ = menu.append(&MenuItem::with_id(MENU_QUIT, "Quit", true, None));
@@ -86,11 +91,12 @@ pub fn run(
     let thread_id = unsafe { GetCurrentThreadId() };
     let pending: Arc<Mutex<Option<Config>>> = Arc::new(Mutex::new(None));
     let pending_status: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let pending_update: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
 
     let img = crate::icon_rgba();
     let icon = Icon::from_rgba(img.data.clone(), img.width, img.height)?;
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(build_menu(&cfg)))
+        .with_menu(Box::new(build_menu(&cfg, None)))
         .with_icon(icon)
         .with_tooltip(APP_NAME)
         // Left click opens settings like on Linux; the menu is on right click.
@@ -113,6 +119,10 @@ pub fn run(
         let event = match e.id.0.as_str() {
             MENU_SETTINGS => {
                 crate::daemon::open_settings();
+                return;
+            }
+            MENU_UPDATE => {
+                crate::update::activate();
                 return;
             }
             MENU_RECONNECT => Event::Reconnect,
@@ -138,6 +148,10 @@ pub fn run(
 
     let reload_pending = pending.clone();
     let status_pending = pending_status.clone();
+    let update_pending = pending_update.clone();
+    // The menu is rebuilt on reload and on update changes, each needing the other.
+    let mut menu_cfg = cfg.clone();
+    let mut update_label: Option<String> = None;
     start(
         cfg,
         Hooks {
@@ -151,6 +165,10 @@ pub fn run(
             on_status: std::sync::Arc::new(move |text| {
                 *status_pending.lock().unwrap() = Some(text);
                 unsafe { PostThreadMessageW(thread_id, WM_APP_STATUS, 0, 0) };
+            }),
+            on_update: std::sync::Arc::new(move |label| {
+                *update_pending.lock().unwrap() = Some(label);
+                unsafe { PostThreadMessageW(thread_id, WM_APP_UPDATE, 0, 0) };
             }),
         },
     );
@@ -169,13 +187,21 @@ pub fn run(
                 }
                 continue;
             }
+            if msg.hwnd.is_null() && msg.message == WM_APP_UPDATE {
+                if let Some(label) = pending_update.lock().unwrap().take() {
+                    update_label = label;
+                    tray.set_menu(Some(Box::new(build_menu(&menu_cfg, update_label.as_deref()))));
+                }
+                continue;
+            }
             if msg.hwnd.is_null() && msg.message == WM_APP_RELOAD {
                 if let Some(cfg) = pending.lock().unwrap().take() {
                     let _ = manager.unregister_all(&registered);
                     let (r, m) = register(&manager, &cfg);
                     registered = r;
                     *map.lock().unwrap() = m;
-                    tray.set_menu(Some(Box::new(build_menu(&cfg))));
+                    tray.set_menu(Some(Box::new(build_menu(&cfg, update_label.as_deref()))));
+                    menu_cfg = cfg;
                 }
                 continue;
             }

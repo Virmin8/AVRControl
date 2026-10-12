@@ -93,15 +93,41 @@ Every [release](https://github.com/Virmin8/AVRControl/releases) has:
 | `avrcontrol-<version>-1-x86_64.pkg.tar.zst` | Arch Linux and derivatives |
 | `avrcontrol-<version>-x86_64.AppImage` | Other Linux distributions |
 
+### Updates
+
+AVR Control looks for a new release when it starts and every two days after
+that (turn this off in Settings → General, which also has **Check now**). When
+one is out you get a notification and an entry in the tray menu:
+
+- **Windows installer and AppImage:** choose **Update to x.y.z** in the tray
+  menu. AVR Control downloads the release, checks it against its published
+  SHA-256, installs it and starts again.
+- **Arch package:** updates arrive with `sudo pacman -Syu` once you've added the
+  repository below.
+- **Portable Windows `.exe` and source builds:** the tray entry opens the
+  release page.
+
 ## Linux
 
 ### Install (Arch / pacman)
 
-Install the release package:
+Add the AVR Control repository to the end of `/etc/pacman.conf`:
+
+```ini
+[avrcontrol]
+SigLevel = Optional TrustAll
+Server = https://github.com/Virmin8/AVRControl/releases/latest/download
+```
+
+Then install it, and later updates come with your normal system update:
 
 ```sh
-sudo pacman -U avrcontrol-<version>-1-x86_64.pkg.tar.zst
+sudo pacman -Syu avrcontrol
 ```
+
+The repository is unsigned, hence `TrustAll`; that's the same trust as
+downloading the package from the release page and installing it with
+`sudo pacman -U avrcontrol-<version>-1-x86_64.pkg.tar.zst`, which also works.
 
 Or build it from source:
 

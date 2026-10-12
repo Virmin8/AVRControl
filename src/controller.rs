@@ -48,6 +48,8 @@ pub struct Hooks {
     pub on_quit: Box<dyn Fn() + Send>,
     /// New tray tooltip text (receiver status summary).
     pub on_status: Arc<dyn Fn(String) + Send + Sync>,
+    /// Tray entry for an available update (its label), or None to hide it.
+    pub on_update: Arc<dyn Fn(Option<String>) + Send + Sync>,
 }
 
 pub struct Controller {

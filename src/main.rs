@@ -14,6 +14,7 @@ mod models;
 mod monitors;
 mod platform;
 mod repeat;
+mod update;
 
 use std::sync::OnceLock;
 use std::time::Duration;

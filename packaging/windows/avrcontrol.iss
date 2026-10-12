@@ -57,6 +57,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\avrcontrol.exe"; Description: "Start AVR Control"; Flags: nowait postinstall skipifsilent
+; In-app updates run this installer with /SILENT after quitting the app; start it again.
+Filename: "{app}\avrcontrol.exe"; Parameters: "daemon"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{app}\avrcontrol.exe"; Parameters: "quit"; Flags: runhidden; RunOnceId: "QuitApp"

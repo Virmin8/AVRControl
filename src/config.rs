@@ -52,6 +52,8 @@ pub struct GeneralConfig {
     pub startup_shortcut: String,
     pub notifications: bool,
     pub volume_osd: bool,
+    /// Look for a new release on GitHub (at launch and every 48 hours).
+    pub check_updates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -271,6 +273,7 @@ impl Default for GeneralConfig {
             startup_shortcut: "pc".into(),
             notifications: true,
             volume_osd: true,
+            check_updates: true,
         }
     }
 }

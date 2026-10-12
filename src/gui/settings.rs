@@ -85,6 +85,8 @@ struct SettingsApp {
     discovery: Task<Vec<DiscoveredReceiver>>,
     monitor_test: Task<()>,
     probe: Task<Capabilities>,
+    /// "Check now" on the General tab.
+    update_check: Task<String>,
     /// When the receiver status was last requested (auto-refresh on the Receiver tab).
     status_at: Instant,
     show_receiver_settings: bool,
@@ -324,6 +326,7 @@ impl SettingsApp {
             discovery: Task::new(),
             monitor_test: Task::new(),
             probe: Task::new(),
+            update_check: Task::new(),
             status_at: Instant::now(),
             show_receiver_settings: false,
             monitors_at: Instant::now(),
@@ -2404,6 +2407,45 @@ impl SettingsApp {
             ui.add_space(12.0);
             theme::card(ui, icon::INFO, "About", None, |ui| {
                 theme::kv(ui, "Version", env!("CARGO_PKG_VERSION"));
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.cfg.general.check_updates,
+                        "Check for updates automatically",
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let checking = self.update_check.running();
+                        let label = if checking { "Checking…" } else { "Check now" };
+                        if ui
+                            .add_enabled(!checking, egui::Button::new(label))
+                            .clicked()
+                        {
+                            // Through the background service when it runs, so its
+                            // tray entry appears too.
+                            let daemon = self.daemon_running;
+                            self.update_check.start(ui.ctx(), move || {
+                                if daemon {
+                                    ipc::request_with_timeout(
+                                        "check-updates",
+                                        Duration::from_secs(30),
+                                    )
+                                } else {
+                                    crate::update::describe_latest()
+                                }
+                            });
+                        }
+                    });
+                });
+                match &self.update_check.result {
+                    Some(Ok(text)) => {
+                        ui.label(RichText::new(text).color(theme::TEXT_SECONDARY));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(
+                            RichText::new(format!("Couldn't check: {e}")).color(theme::WARNING),
+                        );
+                    }
+                    None => {}
+                }
                 theme::kv(ui, "Config file", Config::path().display().to_string());
                 theme::kv(
                     ui,
@@ -2427,6 +2469,7 @@ impl eframe::App for SettingsApp {
         }
         self.receiver.poll();
         self.discovery.poll();
+        self.update_check.poll();
         self.monitor_test.poll();
         // Keep the status live while the Receiver tab is showing (the probe
         // uses its own connection, so wait for it to finish first).

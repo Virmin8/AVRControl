@@ -73,6 +73,7 @@ fn handle_request(req: &str, tx: &mpsc::Sender<Event>) -> Result<String> {
                 .map_err(|_| anyhow::anyhow!("no answer from the background service"))?
                 .map_err(|e| anyhow::anyhow!(e));
         }
+        "check-updates" => return crate::update::check_now(),
         "reload" => Event::Reload,
         "reconnect" => Event::Reconnect,
         "quit" => Event::Quit,
@@ -97,9 +98,13 @@ pub fn run() -> Result<()> {
         open_settings();
     }
 
+    crate::update::clean_stale_download();
+    let update_tx = tx.clone();
     let result = platform::run(cfg, tx, move |cfg, hooks| {
+        crate::update::spawn(update_tx, hooks.on_update.clone());
         thread::spawn(move || Controller::new(cfg, hooks).run(rx));
     });
     ipc::cleanup();
+    crate::update::restart_if_updated();
     result
 }
