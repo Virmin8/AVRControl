@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 use global_hotkey::hotkey::HotKey;
@@ -28,14 +28,10 @@ const MENU_RECONNECT: &str = "__reconnect";
 const MENU_QUIT: &str = "__quit";
 const MENU_UPDATE: &str = "__update";
 
-static SHUTDOWN_TX: OnceLock<Sender<Event>> = OnceLock::new();
-
 unsafe extern "system" fn session_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // wParam: the session really is ending. Logging off leaves the receiver alone.
     if msg == WM_ENDSESSION && wp != 0 && (lp as u32 & ENDSESSION_LOGOFF) == 0 {
-        if let Some(tx) = SHUTDOWN_TX.get() {
-            crate::controller::shutdown(tx);
-        }
+        crate::shutdown::power_off();
         return 0;
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -44,8 +40,7 @@ unsafe extern "system" fn session_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 /// A hidden top-level window: only those are sent WM_QUERYENDSESSION and
 /// WM_ENDSESSION when Windows shuts down (thread messages and message-only
 /// windows aren't).
-fn create_session_window(tx: Sender<Event>) {
-    let _ = SHUTDOWN_TX.set(tx);
+fn create_session_window() {
     let class: Vec<u16> = "AVRControlSession\0".encode_utf16().collect();
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
@@ -177,7 +172,7 @@ pub fn run(
         let _ = menu_tx.send(event);
     }));
 
-    create_session_window(tx.clone());
+    create_session_window();
 
     let manager = GlobalHotKeyManager::new()?;
     let (mut registered, map) = register(&manager, &cfg);

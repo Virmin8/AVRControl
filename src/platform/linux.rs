@@ -264,68 +264,6 @@ async fn portal_manager(
     }
 }
 
-/// Holds a logind "delay" inhibitor so that, when the computer shuts down,
-/// the controller gets a few seconds to turn the receiver off first.
-async fn watch_shutdown(tx: Sender<Event>) -> zbus::Result<()> {
-    use futures_util::StreamExt;
-
-    let conn = zbus::Connection::system().await?;
-    let logind: zbus::Proxy = zbus::proxy::Builder::new(&conn)
-        .destination("org.freedesktop.login1")?
-        .path("/org/freedesktop/login1")?
-        .interface("org.freedesktop.login1.Manager")?
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
-        .await?;
-    let mut signals = logind.receive_signal("PrepareForShutdown").await?;
-    loop {
-        let lock: zbus::zvariant::OwnedFd = logind
-            .call(
-                "Inhibit",
-                &("shutdown", APP_NAME, "Turning off the receiver", "delay"),
-            )
-            .await?;
-        // PrepareForShutdown(true) when it starts, (false) if it's cancelled.
-        let mut starting = false;
-        while !starting {
-            let Some(msg) = signals.next().await else {
-                return Ok(());
-            };
-            starting = msg.body().deserialize::<bool>()?;
-        }
-        if !is_reboot(&logind).await {
-            let tx = tx.clone();
-            let _ = tokio::task::spawn_blocking(move || crate::controller::shutdown(&tx)).await;
-        }
-        drop(lock);
-        // Still running: the shutdown was cancelled. Wait for logind to say
-        // so, then take a new lock.
-        while starting {
-            let Some(msg) = signals.next().await else {
-                return Ok(());
-            };
-            starting = msg.body().deserialize::<bool>()?;
-        }
-    }
-}
-
-/// A reboot rather than a power-off; the receiver is left on since this PC
-/// will be back shortly. Needs systemd 255+; older versions count as power-off.
-async fn is_reboot(logind: &zbus::Proxy<'_>) -> bool {
-    use std::collections::HashMap;
-    use zbus::zvariant::OwnedValue;
-
-    let Ok(meta) = logind
-        .get_property::<HashMap<String, OwnedValue>>("PreparingForShutdownWithMetadata")
-        .await
-    else {
-        return false;
-    };
-    meta.get("type")
-        .and_then(|v| <&str>::try_from(&**v).ok())
-        .is_some_and(|t| matches!(t, "reboot" | "soft-reboot" | "kexec"))
-}
-
 pub fn run(
     cfg: Config,
     tx: Sender<Event>,
@@ -380,19 +318,20 @@ pub fn run(
             }
         };
 
+        if cfg.general.shutdown_power_off {
+            crate::shutdown::start_watcher();
+        }
+
         let (portal_tx, portal_rx) = unbounded_channel();
         tokio::spawn(portal_manager(portal_rx, tx.clone()));
-        let shutdown_tx = tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = watch_shutdown(shutdown_tx).await {
-                eprintln!("shutdown handling unavailable: {e}");
-            }
-        });
         let _ = portal_tx.send(PortalMsg::Bind(Box::new(cfg)));
 
         while let Some(msg) = prx.recv().await {
             match msg {
                 Msg::Rebind(cfg) => {
+                    if cfg.general.shutdown_power_off {
+                        crate::shutdown::start_watcher();
+                    }
                     if let Some(t) = &tray {
                         let entries = menu_entries(&cfg);
                         t.update(move |t| t.shortcuts = entries).await;

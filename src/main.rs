@@ -14,6 +14,7 @@ mod models;
 mod monitors;
 mod platform;
 mod repeat;
+mod shutdown;
 mod update;
 
 use std::sync::OnceLock;
@@ -79,7 +80,7 @@ fn attach_console() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() && !matches!(args[0].as_str(), "daemon" | "settings" | "osd") {
+    if !args.is_empty() && !matches!(args[0].as_str(), "daemon" | "settings" | "osd" | "shutdown-watch") {
         attach_console();
     }
     if let Err(e) = run(&args) {
@@ -102,6 +103,8 @@ fn run(args: &[String]) -> Result<()> {
         "daemon" => daemon::run(),
         "settings" => gui::settings::run(args.get(1).map(String::as_str)),
         "osd" => gui::osd::run(),
+        #[cfg(target_os = "linux")]
+        "shutdown-watch" => shutdown::watch(),
         "trigger" => {
             let Some(id) = args.get(1) else {
                 bail!("usage: avrcontrol trigger <ID>")
