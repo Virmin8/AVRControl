@@ -3,7 +3,7 @@
 All notable changes to AVR Control. Versions follow
 [semantic versioning](https://semver.org); each heading links to its release.
 
-## [Unreleased]
+## [1.3.0] - 2026-10-15
 
 ### Added
 - **Keep the receiver's audio connection awake** (Settings → General →
@@ -109,6 +109,7 @@ First release.
   left-click on the tray icon opening Settings, and monitors that ignore
   DDC/CI for a few seconds while switching inputs.
 
+[1.3.0]: https://github.com/Virmin8/AVRControl/releases/tag/v1.3.0
 [1.2.1]: https://github.com/Virmin8/AVRControl/releases/tag/v1.2.1
 [1.2.0]: https://github.com/Virmin8/AVRControl/releases/tag/v1.2.0
 [1.1.2]: https://github.com/Virmin8/AVRControl/releases/tag/v1.1.2

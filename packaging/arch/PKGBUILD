@@ -4,7 +4,7 @@
 # `makepkg -si` here installs whatever is checked out locally.
 
 pkgname=avrcontrol
-pkgver=1.2.1
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="Control an Onkyo AV receiver and monitor inputs (DDC/CI) with global shortcuts"
 arch=('x86_64' 'aarch64')
