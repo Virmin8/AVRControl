@@ -32,6 +32,10 @@ hotkeys. It runs in the system tray on Linux (Wayland and X11) and Windows.
   power and volume, sound, HDMI, system and zones.
 - Optionally turns the receiver off when the PC shuts down, if it's still on
   the startup input.
+- Optionally keeps the receiver's audio connection awake by playing an
+  inaudible signal to its output, so the start of sounds isn't cut off
+  after a quiet moment (Linux needs `pacat`/`pactl` from libpulse or
+  pulseaudio-utils).
 - Works with receivers that allow only one network client: the settings
   window and command line share the background service's connection.
 
@@ -73,7 +77,7 @@ or running `avrcontrol` while the app is already running.
 | Receiver | **Controls**: every supported function, grouped into power and volume, sound, HDMI, system and zones, plus raw commands. **Setup**: IP address (**Find on network** searches for it), connection test, volume steps, supported features, and renaming or hiding receiver inputs. |
 | Monitors | Everything each connected display reports: graphics-card connector (e.g. `DP-1`), current input, signal, resolution, HDR, brightness and more. |
 | Shortcuts | Add, edit and reorder shortcuts. Set the hotkey (type it or press **Record**), then pick a receiver input and a target input for each monitor. |
-| General | Startup action, turning the receiver off at shutdown (only if it is still on the startup input), notifications, volume indicator, start on login, and start/stop of the background service. |
+| General | Startup action, turning the receiver off at shutdown (only if it is still on the startup input), audio keep-alive and its output, notifications, volume indicator, start on login, and start/stop of the background service. |
 
 The configuration is stored in `~/.config/avrcontrol/config.toml` (Linux) or
 `%APPDATA%\avrcontrol\config\config.toml` (Windows).

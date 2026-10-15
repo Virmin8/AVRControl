@@ -17,7 +17,7 @@ use crate::controller::{Event, Hooks};
 use crate::hotkey::Hotkey;
 
 enum Msg {
-    Rebind(Config),
+    Rebind(Box<Config>),
     Status(String),
     Update(Option<String>),
     ConfigureShortcuts,
@@ -284,7 +284,7 @@ pub fn run(
             cfg.clone(),
             Hooks {
                 on_reload: Box::new(move |c| {
-                    let _ = reload_tx.send(Msg::Rebind(c.clone()));
+                    let _ = reload_tx.send(Msg::Rebind(Box::new(c.clone())));
                 }),
                 on_quit: Box::new(move || {
                     let _ = quit_tx.send(Msg::Quit);
@@ -336,7 +336,7 @@ pub fn run(
                         let entries = menu_entries(&cfg);
                         t.update(move |t| t.shortcuts = entries).await;
                     }
-                    let _ = portal_tx.send(PortalMsg::Bind(Box::new(cfg)));
+                    let _ = portal_tx.send(PortalMsg::Bind(cfg));
                 }
                 Msg::Status(text) => {
                     if let Some(t) = &tray {

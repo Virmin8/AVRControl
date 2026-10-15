@@ -1,6 +1,7 @@
 // No console window when launched from Explorer / autostart on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod audio;
 mod autostart;
 mod config;
 mod controller;

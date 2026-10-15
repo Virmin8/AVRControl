@@ -279,6 +279,7 @@ impl Controller {
         let receiver_changed = cfg.receiver.host != self.cfg.receiver.host
             || cfg.receiver.port != self.cfg.receiver.port;
         self.feedback.apply_config(&cfg);
+        crate::audio::apply(&cfg.audio);
         (self.hooks.on_reload)(&cfg);
         self.cfg = cfg;
         self.receiver.set_features(&self.cfg.effective_features());

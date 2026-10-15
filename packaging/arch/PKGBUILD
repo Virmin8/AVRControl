@@ -26,6 +26,7 @@ makedepends=('cargo')
 optdepends=(
   'xdg-desktop-portal-kde: global shortcuts on KDE Plasma'
   'xdg-desktop-portal-gnome: global shortcuts on GNOME 48+'
+  'libpulse: audio keep-alive (pacat, pactl)'
 )
 install=avrcontrol.install
 options=('!lto' '!debug')

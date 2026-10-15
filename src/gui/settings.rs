@@ -11,7 +11,7 @@ use crate::eiscp::{self, Capabilities, DiscoveredReceiver, ReceiverStatus};
 use crate::gui::theme::{self, icon};
 use crate::hotkey::{self, Hotkey};
 use crate::monitors::{self, MonitorInfo};
-use crate::{autostart, ipc};
+use crate::{audio, autostart, ipc};
 
 /// A background job whose result is polled from the UI thread.
 struct Task<T> {
@@ -87,6 +87,8 @@ struct SettingsApp {
     probe: Task<Capabilities>,
     /// "Check now" on the General tab.
     update_check: Task<String>,
+    /// Audio outputs for the keep-alive picker on the General tab.
+    audio_devices: Task<Vec<audio::Device>>,
     /// When the receiver status was last requested (auto-refresh on the Receiver tab).
     status_at: Instant,
     /// Receiver tab: setup (features, inputs, volume scale) instead of controls.
@@ -441,6 +443,7 @@ impl SettingsApp {
             monitor_test: Task::new(),
             probe: Task::new(),
             update_check: Task::new(),
+            audio_devices: Task::new(),
             status_at: Instant::now(),
             receiver_setup: false,
             monitors_at: Instant::now(),
@@ -463,6 +466,7 @@ impl SettingsApp {
             );
         }
         app.scan_monitors(ctx);
+        app.audio_devices.start(ctx, audio::devices);
         if !app.cfg.receiver.host.trim().is_empty() {
             app.refresh_receiver(ctx);
         }
@@ -2799,6 +2803,8 @@ impl SettingsApp {
                 );
             });
             ui.add_space(12.0);
+            self.audio_card(ui);
+            ui.add_space(12.0);
             theme::card(ui, icon::INFO, "About", None, |ui| {
                 theme::kv(ui, "Version", env!("CARGO_PKG_VERSION"));
                 ui.horizontal(|ui| {
@@ -2851,6 +2857,81 @@ impl SettingsApp {
     }
 }
 
+impl SettingsApp {
+    fn audio_card(&mut self, ui: &mut egui::Ui) {
+        theme::card(
+            ui,
+            icon::SPEAKER,
+            "Audio",
+            Some("Keeps the receiver locked onto this PC's audio."),
+            |ui| {
+                ui.checkbox(
+                    &mut self.cfg.audio.keep_alive,
+                    "Keep the receiver's audio connection awake",
+                )
+                .on_hover_text(
+                    "Plays an inaudible signal to the output below, so the receiver \
+                     doesn't cut off the start of sounds after a quiet moment.",
+                );
+                ui.add_enabled_ui(self.cfg.audio.keep_alive, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Output").color(theme::TEXT_SECONDARY));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.audio_devices.running(),
+                                    egui::Button::new(icon::REFRESH),
+                                )
+                                .on_hover_text("Look for outputs again")
+                                .clicked()
+                            {
+                                self.audio_devices.start(ui.ctx(), audio::devices);
+                            }
+                            let list = self.audio_devices.ok().cloned().unwrap_or_default();
+                            let current = &self.cfg.audio.device;
+                            let text = if current.is_empty() {
+                                "Default output".to_string()
+                            } else {
+                                list.iter()
+                                    .find(|d| &d.id == current)
+                                    .map(|d| d.label.clone())
+                                    .unwrap_or_else(|| {
+                                        if self.audio_devices.running() {
+                                            current.clone()
+                                        } else {
+                                            format!("{current} (not connected)")
+                                        }
+                                    })
+                            };
+                            let mut choice = current.clone();
+                            egui::ComboBox::from_id_salt("audio_device")
+                                .selected_text(text)
+                                .width(320.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut choice,
+                                        String::new(),
+                                        "Default output",
+                                    );
+                                    for d in &list {
+                                        ui.selectable_value(&mut choice, d.id.clone(), &d.label);
+                                    }
+                                });
+                            self.cfg.audio.device = choice;
+                        });
+                    });
+                });
+                if let Some(Err(e)) = &self.audio_devices.result {
+                    ui.label(
+                        RichText::new(format!("Couldn't list audio outputs: {e}"))
+                            .color(theme::WARNING),
+                    );
+                }
+            },
+        );
+    }
+}
+
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.monitors.running() {
@@ -2864,6 +2945,7 @@ impl eframe::App for SettingsApp {
         self.receiver.poll();
         self.discovery.poll();
         self.update_check.poll();
+        self.audio_devices.poll();
         self.monitor_test.poll();
         // Keep the status live while the Receiver tab is showing (the probe
         // uses its own connection, so wait for it to finish first).

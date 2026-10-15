@@ -98,6 +98,7 @@ pub fn run() -> Result<()> {
         open_settings();
     }
 
+    crate::audio::apply(&cfg.audio);
     crate::update::clean_stale_download();
     let update_tx = tx.clone();
     let result = platform::run(cfg, tx, move |cfg, hooks| {

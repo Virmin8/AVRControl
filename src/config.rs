@@ -16,6 +16,7 @@ pub const APP_NAME: &str = "AVR Control";
 pub struct Config {
     pub receiver: ReceiverConfig,
     pub general: GeneralConfig,
+    pub audio: AudioConfig,
     pub shortcuts: Vec<Shortcut>,
 }
 
@@ -57,6 +58,17 @@ pub struct GeneralConfig {
     pub volume_osd: bool,
     /// Look for a new release on GitHub (at launch and every 48 hours).
     pub check_updates: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Play an inaudible signal to the receiver's audio output so the HDMI
+    /// audio link stays up (no cut-off start of sounds).
+    pub keep_alive: bool,
+    /// Output to keep alive: PulseAudio/PipeWire sink name on Linux, endpoint
+    /// name on Windows. Empty = the default output.
+    pub device: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -308,6 +320,7 @@ impl Default for Config {
         Self {
             receiver: ReceiverConfig::default(),
             general: GeneralConfig::default(),
+            audio: AudioConfig::default(),
             shortcuts: vec![
                 simple("power", "Power toggle", "P", Action::PowerToggle),
                 switch("pc", "Source: PC", "F1", "05", true),

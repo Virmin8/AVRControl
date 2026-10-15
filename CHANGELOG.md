@@ -3,6 +3,16 @@
 All notable changes to AVR Control. Versions follow
 [semantic versioning](https://semver.org); each heading links to its release.
 
+## [Unreleased]
+
+### Added
+- **Keep the receiver's audio connection awake** (Settings → General →
+  Audio): plays an inaudible signal to the chosen audio output, or the
+  default one, so the receiver doesn't cut off the start of sounds after a
+  quiet moment. Picks the output back up when it reappears, e.g. after the
+  receiver turns on. On Linux it plays through `pacat` (libpulse /
+  pulseaudio-utils), on Windows through WASAPI.
+
 ## [1.2.1] - 2026-10-12
 
 ### Changed
