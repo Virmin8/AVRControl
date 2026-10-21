@@ -47,7 +47,7 @@ fn handle_request(req: &str, tx: &mpsc::Sender<Event>) -> Result<String> {
             }
             Event::Trigger(id.to_string())
         }
-        "status" | "probe" | "send" => {
+        "status" | "probe" | "send" | "verify" => {
             // "status <host> <port>"
             let mut parts = arg.split_whitespace();
             let host = parts.next().unwrap_or("").to_string();
@@ -58,6 +58,16 @@ fn handle_request(req: &str, tx: &mpsc::Sender<Event>) -> Result<String> {
             let kind = match cmd {
                 "status" => QueryKind::Status,
                 "probe" => QueryKind::Probe,
+                // "verify <host> <port> PWR,MVL,..."
+                "verify" => QueryKind::Verify(
+                    parts
+                        .next()
+                        .unwrap_or("")
+                        .split(',')
+                        .filter(|g| !g.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ),
                 // "send <host> <port> <COMMAND>"
                 _ => QueryKind::Command(parts.next().unwrap_or("").to_string()),
             };

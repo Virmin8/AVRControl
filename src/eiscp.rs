@@ -4,7 +4,7 @@
 //! | version (u8, 1) | 3 reserved bytes | data. Data is "!1<CMD><PARAM>\r";
 //! the receiver answers with "!1<CMD><PARAM>\x1a\r\n".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -441,6 +441,20 @@ fn take_packet(buf: &mut Vec<u8>) -> Option<String> {
     Some(msg)
 }
 
+/// How a command group fared when checked on the receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Check {
+    /// Answered with a value.
+    Works,
+    /// Answered "N/A": the receiver has it, but it isn't available right now
+    /// (e.g. zone 2 volume while zone 2 is off).
+    NotNow,
+    /// No answer. Either it isn't there, or it only answers in some other
+    /// state (network playback info only answers while a network source plays).
+    NoAnswer,
+}
+
 /// What a `Receiver`'s listener is told about.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Push<'a> {
@@ -718,13 +732,7 @@ impl Receiver {
             .copied()
             .filter(|g| !self.unsupported.contains(*g))
             .collect();
-        let mut replies = Self::retrying(|| {
-            let r = self.batch_once(&groups, OPTIONAL_TIMEOUT);
-            if r.is_err() {
-                self.disconnect();
-            }
-            r
-        })?;
+        let mut replies = self.batch(&groups)?;
         // Commands the receiver is known to have but didn't answer may have
         // been dropped in the rush; ask those once more on their own.
         let missed: Vec<&str> = groups
@@ -738,6 +746,43 @@ impl Receiver {
             }
         }
         Ok(replies)
+    }
+
+    /// `batch_once`, reconnecting and starting over if the connection drops.
+    fn batch(&mut self, groups: &[&str]) -> Result<HashMap<String, String>> {
+        Self::retrying(|| {
+            let r = self.batch_once(groups, OPTIONAL_TIMEOUT);
+            if r.is_err() {
+                self.disconnect();
+            }
+            r
+        })
+    }
+
+    /// Checks which of `groups` the receiver answers a `QSTN` query for.
+    /// Unanswered ones are asked a second time before they count as such.
+    /// Read-only: nothing on the receiver changes.
+    pub fn verify(&mut self, groups: &[&str]) -> Result<BTreeMap<String, Check>> {
+        let mut replies = self.batch(groups)?;
+        let missed: Vec<&str> = groups
+            .iter()
+            .copied()
+            .filter(|g| !replies.contains_key(*g))
+            .collect();
+        if !missed.is_empty() {
+            replies.extend(self.batch(&missed)?);
+        }
+        Ok(groups
+            .iter()
+            .map(|g| {
+                let check = match replies.get(*g).and_then(|m| m.get(3..)) {
+                    None => Check::NoAnswer,
+                    Some("N/A") => Check::NotNow,
+                    Some(_) => Check::Works,
+                };
+                (g.to_string(), check)
+            })
+            .collect())
     }
 
     fn batch_once(

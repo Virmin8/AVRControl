@@ -20,6 +20,11 @@ const STATUS_DELAY: Duration = Duration::from_millis(700);
 /// How long a full status read stays good enough to answer the settings
 /// window from. In between, updates the receiver sends keep it current.
 const STATUS_FRESH: Duration = Duration::from_secs(10);
+/// After the receiver drops our connection (often because another app
+/// connected, and some models allow only one), the settings window is shown
+/// the last known status for this long instead of reconnecting at once;
+/// the keepalive reconnects in the meantime.
+const STATUS_HOLD: Duration = Duration::from_secs(60);
 /// How often the monitors' inputs are read for the tray tooltip (DDC/CI
 /// traffic), besides shortly after a shortcut switched them.
 const MONITORS_REFRESH: Duration = Duration::from_secs(300);
@@ -66,6 +71,8 @@ pub enum QueryKind {
     Probe,
     /// Send one raw command; answered with the receiver's reply.
     Command(String),
+    /// Check which of these command groups the receiver answers.
+    Verify(Vec<String>),
 }
 
 /// Set while a tray action is queued, so fast scrolling can't build up a
@@ -177,7 +184,6 @@ impl Controller {
                 }
             }
             Push::Closed => {
-                live.lock().unwrap().read_at = None;
                 let _ = tx.send(Event::Disconnected);
             }
         }));
@@ -325,10 +331,18 @@ impl Controller {
         if same {
             let json = match kind {
                 QueryKind::Status => {
+                    let connected = self.receiver.is_connected();
+                    let reachable = self.online == Some(true);
                     let cached = {
                         let live = self.live.lock().unwrap();
                         live.read_at
-                            .filter(|t| t.elapsed() < STATUS_FRESH && self.receiver.is_connected())
+                            .filter(|t| {
+                                if connected {
+                                    t.elapsed() < STATUS_FRESH
+                                } else {
+                                    reachable && t.elapsed() < STATUS_HOLD
+                                }
+                            })
                             .map(|_| live.status.clone())
                     };
                     let status = match cached {
@@ -342,6 +356,10 @@ impl Controller {
                     serde_json::to_string(&status)?
                 }
                 QueryKind::Probe => serde_json::to_string(&self.receiver.probe()?)?,
+                QueryKind::Verify(groups) => {
+                    let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
+                    serde_json::to_string(&self.receiver.verify(&groups)?)?
+                }
                 QueryKind::Command(cmd) => {
                     let reply = self.send(&cmd)?;
                     self.status_stale = true;
@@ -355,6 +373,10 @@ impl Controller {
         let json = match kind {
             QueryKind::Status => serde_json::to_string(&receiver.status_with_model()?)?,
             QueryKind::Probe => serde_json::to_string(&receiver.probe()?)?,
+            QueryKind::Verify(groups) => {
+                let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
+                serde_json::to_string(&receiver.verify(&groups)?)?
+            }
             QueryKind::Command(cmd) => serde_json::to_string(&receiver.send(&cmd)?)?,
         };
         receiver.disconnect();
@@ -456,6 +478,7 @@ impl Controller {
             Err(_) => {
                 // Quietly drop it; the next command reconnects on demand.
                 self.receiver.disconnect();
+                self.live.lock().unwrap().read_at = None;
                 crate::audio::set_receiver_power(None);
                 self.set_receiver_status("Receiver not responding".into());
             }

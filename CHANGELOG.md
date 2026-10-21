@@ -21,6 +21,9 @@ All notable changes to AVR Control. Versions follow
   middle-click to mute (Linux and Windows). Can be turned off under General.
 - The audio keep-alive pauses while the receiver is in standby (on by
   default, under General → Audio).
+- **Check on receiver** (Settings → Receiver → Setup): asks the receiver
+  about every command its model should have, without changing anything, and
+  marks the ones that don't answer or aren't available right now.
 
 ### Changed
 - Reading the receiver's status is much quicker: all the questions go out
@@ -32,6 +35,10 @@ All notable changes to AVR Control. Versions follow
   the Status page, and the tray tooltip reads the monitors' inputs every
   five minutes and after a shortcut switches them, instead of after every
   action.
+- When the receiver drops the connection (some models allow only one app at
+  a time), the settings window keeps showing the last known status for up to
+  a minute instead of reconnecting straight away and knocking the other app
+  off.
 - The receiver's model comes from the settings when it's known, instead of
   a network query; when a query fails, it isn't repeated every 30 seconds.
 

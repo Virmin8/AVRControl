@@ -43,6 +43,9 @@ pub struct ReceiverConfig {
     /// Feature probe results (command group -> supported), see eiscp::FEATURES.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub features: BTreeMap<String, bool>,
+    /// Result of the last "Check on receiver" (command group -> result).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verified: BTreeMap<String, crate::eiscp::Check>,
     /// User labels for receiver inputs, keyed by the two-digit SLI code.
     pub input_names: BTreeMap<String, String>,
     /// SLI codes hidden from input pickers.
@@ -302,6 +305,7 @@ impl Default for ReceiverConfig {
             model: String::new(),
             features_source: String::new(),
             features: BTreeMap::new(),
+            verified: BTreeMap::new(),
             input_names: BTreeMap::new(),
             hidden_inputs: Vec::new(),
         }
@@ -489,6 +493,23 @@ impl Config {
             raw_max
         };
         shown.min(u8::MAX as u32) as u8
+    }
+
+    /// Command groups that can be checked without changing anything: those
+    /// the spreadsheet lists a `QSTN` query for, or every detectable feature
+    /// for a model it doesn't know.
+    pub fn verifiable_groups(&self) -> Vec<String> {
+        match self.model_table() {
+            Some(t) => t
+                .iter()
+                .filter(|(_, v)| v.iter().any(|v| v == "QSTN"))
+                .map(|(g, _)| g.clone())
+                .collect(),
+            None => crate::eiscp::FEATURES
+                .iter()
+                .map(|(g, _)| g.to_string())
+                .collect(),
+        }
     }
 
     /// False only if feature detection ran and the receiver rejected the

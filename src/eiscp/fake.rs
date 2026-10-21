@@ -394,6 +394,67 @@ mod tests {
         );
     }
 
+    /// Against a real receiver: asks every command group its model's
+    /// spreadsheet entry says can be queried, and reports which answer.
+    /// `AVR_HOST=... cargo test hardware_table -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn hardware_table_groups_answer() {
+        let host = std::env::var("AVR_HOST").expect("set AVR_HOST");
+        let cfg = crate::config::Config::load().unwrap();
+        let table = cfg.model_table().expect("model in the spreadsheet");
+        let groups: Vec<&str> = table
+            .iter()
+            .filter(|(_, v)| v.iter().any(|v| v == "QSTN"))
+            .map(|(g, _)| g.as_str())
+            .collect();
+        let mut r = Receiver::new(&host, super::super::DEFAULT_PORT);
+        // One at a time, so a query that upsets the receiver shows up.
+        let mut replies = std::collections::HashMap::new();
+        for g in &groups {
+            match r.exchange(&format!("{g}QSTN"), super::super::OPTIONAL_TIMEOUT) {
+                Ok(Some(m)) => {
+                    replies.insert(g.to_string(), m);
+                }
+                Ok(None) => {}
+                Err(e) => println!("{g}  CONNECTION DROPPED ({e})"),
+            }
+        }
+        r.disconnect();
+        for g in &groups {
+            let state = match replies.get(*g).map(|m| &m[3..]) {
+                None => "NO ANSWER".to_string(),
+                Some("N/A") => "N/A".to_string(),
+                Some(v) => v.chars().take(40).collect(),
+            };
+            println!("{g}  {state}");
+        }
+    }
+
+    #[test]
+    fn verify_sorts_answers() {
+        let fake = FakeReceiver::start();
+        fake.set("ZVL", "N/A");
+        {
+            let mut s = fake.state.lock().unwrap();
+            s.silent.insert("NTM".into());
+            // Lost the first time, answered when asked again.
+            s.drop_once.insert("DIM".into());
+            s.values.insert("DIM".into(), "01".into());
+        }
+        let mut r = receiver(&fake);
+        // Groups marked unsupported are still checked.
+        r.set_features(&[("DIM".to_string(), false)].into_iter().collect());
+        let checks = r.verify(&["PWR", "ZVL", "NTM", "DIM"]).unwrap();
+        use super::super::Check;
+        assert_eq!(checks["PWR"], Check::Works);
+        assert_eq!(checks["ZVL"], Check::NotNow);
+        assert_eq!(checks["NTM"], Check::NoAnswer);
+        assert_eq!(checks["DIM"], Check::Works);
+        // Read-only: only queries went out.
+        assert!(fake.received().iter().all(|c| c.ends_with("QSTN")));
+    }
+
     #[test]
     fn probe_unknown_model_asks_every_feature() {
         let fake = FakeReceiver::start();

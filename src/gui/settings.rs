@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::config::{Action, Config, MonitorId, MonitorTarget, Shortcut};
-use crate::eiscp::{self, Capabilities, DiscoveredReceiver, ReceiverStatus};
+use crate::eiscp::{self, Capabilities, Check, DiscoveredReceiver, ReceiverStatus};
 use crate::gui::theme::{self, icon};
 use crate::hotkey::{self, Hotkey};
 use crate::monitors::{self, MonitorInfo};
@@ -85,6 +85,7 @@ struct SettingsApp {
     discovery: Task<Vec<DiscoveredReceiver>>,
     monitor_test: Task<()>,
     probe: Task<Capabilities>,
+    verify: Task<std::collections::BTreeMap<String, Check>>,
     /// "Check now" on the General tab.
     update_check: Task<String>,
     /// Audio outputs for the keep-alive picker on the General tab.
@@ -442,6 +443,7 @@ impl SettingsApp {
             discovery: Task::new(),
             monitor_test: Task::new(),
             probe: Task::new(),
+            verify: Task::new(),
             update_check: Task::new(),
             audio_devices: Task::new(),
             status_at: Instant::now(),
@@ -495,6 +497,123 @@ impl SettingsApp {
                 r.probe()
             })
         });
+    }
+
+    fn start_verify(&mut self, ctx: &egui::Context) {
+        let host = self.cfg.receiver.host.clone();
+        let port = self.cfg.receiver.port;
+        let groups = self.cfg.verifiable_groups();
+        self.verify.start(ctx, move || {
+            ipc::ask_receiver(
+                "verify",
+                &host,
+                port,
+                &groups.join(","),
+                Duration::from_secs(60),
+                |r| {
+                    let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
+                    r.verify(&groups)
+                },
+            )
+        });
+    }
+
+    /// The last check's results beyond the features grid: what didn't
+    /// answer, and what wasn't available at the time.
+    fn verify_details(&self, ui: &mut egui::Ui) {
+        let checks = &self.cfg.receiver.verified;
+        if checks.is_empty() {
+            return;
+        }
+        let label = |group: &str| {
+            eiscp::FEATURES
+                .iter()
+                .find(|(g, _)| *g == group)
+                .map(|(_, l)| l.to_string())
+                .or_else(|| eiscp::setting_info(group).map(|s| s.label.to_string()))
+                .unwrap_or_else(|| group.to_string())
+        };
+        let list = |c: Check| {
+            checks
+                .iter()
+                .filter(|(_, v)| **v == c)
+                .map(|(g, _)| format!("{} ({g})", label(g)))
+                .collect::<Vec<_>>()
+        };
+        let works = checks.values().filter(|v| **v == Check::Works).count();
+        let (not_now, none) = (list(Check::NotNow), list(Check::NoAnswer));
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(format!(
+                "Last check on the receiver: {works} of {} commands answered{}.",
+                checks.len(),
+                if not_now.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} more exist but weren't available then", not_now.len())
+                }
+            ))
+            .size(12.5)
+            .color(theme::TEXT_SECONDARY),
+        );
+        if !none.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("No answer: {}.", none.join(", ")))
+                        .size(12.5)
+                        .color(theme::WARNING),
+                )
+                .wrap(),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "These may not work on this receiver, or only answer in another state \
+                         (network playback info only while a network source plays, zone \
+                         settings while the zone is on). They're still offered.",
+                    )
+                    .size(12.0)
+                    .color(theme::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+        if !not_now.is_empty() {
+            ui.label(
+                RichText::new(format!("Not available then: {}.", not_now.join(", ")))
+                    .size(12.0)
+                    .color(theme::TEXT_DIM),
+            )
+            .on_hover_text("The receiver has these but said \"N/A\", e.g. a zone that was off.");
+        }
+    }
+
+    /// Stores the check results and saves just them right away.
+    fn apply_verify(&mut self, checks: std::collections::BTreeMap<String, Check>) {
+        let count = |c: Check| checks.values().filter(|v| **v == c).count();
+        let summary = format!(
+            "Checked {} commands on the receiver: {} work, {} not available right now, \
+             {} didn't answer.",
+            checks.len(),
+            count(Check::Works),
+            count(Check::NotNow),
+            count(Check::NoAnswer),
+        );
+        self.cfg.receiver.verified = checks;
+        let mut disk = if self.on_disk {
+            Config::load().unwrap_or_else(|_| self.saved.clone())
+        } else {
+            self.cfg.clone()
+        };
+        disk.receiver.verified = self.cfg.receiver.verified.clone();
+        self.saved.receiver.verified = self.cfg.receiver.verified.clone();
+        match disk.save() {
+            Ok(()) => {
+                self.on_disk = true;
+                self.set_status(summary, false);
+            }
+            Err(e) => self.set_status(format!("{summary} Couldn't save: {e:#}"), true),
+        }
     }
 
     /// Stores detection results and saves them right away, so detection
@@ -1909,8 +2028,11 @@ impl SettingsApp {
 
         // Features and inputs side by side.
         theme::columns(ui, 2, |cols| {
-            let can = !self.cfg.receiver.host.trim().is_empty() && !self.probe.running();
+            let can = !self.cfg.receiver.host.trim().is_empty()
+                && !self.probe.running()
+                && !self.verify.running();
             let mut detect = false;
+            let mut verify = false;
             theme::card_with(
                 &mut cols[0],
                 icon::LAYERS,
@@ -1923,7 +2045,18 @@ impl SettingsApp {
                     {
                         detect = true;
                     }
-                    if self.probe.running() {
+                    if ui
+                        .add_enabled(can, egui::Button::new("Check on receiver"))
+                        .on_hover_text(
+                            "Asks the receiver about every command it should have and \
+                             marks the ones that don't answer. Read-only: nothing changes \
+                             on the receiver.",
+                        )
+                        .clicked()
+                    {
+                        verify = true;
+                    }
+                    if self.probe.running() || self.verify.running() {
                         ui.add(egui::Spinner::new());
                     }
                 },
@@ -1950,7 +2083,7 @@ impl SettingsApp {
                                 .color(theme::TEXT_DIM),
                         );
                     }
-                    if self.probe.running() {
+                    if self.probe.running() || self.verify.running() {
                         ui.label("Asking the receiver (takes a few seconds)…");
                     }
                     if let Some(Err(e)) = &self.probe.result {
@@ -1977,21 +2110,58 @@ impl SettingsApp {
                                         .color(theme::TEXT_SECONDARY),
                                 )
                                 .on_hover_text(format!("{group}QSTN"));
-                                ui.label(
-                                    RichText::new(if *ok { "yes" } else { "no" })
-                                        .font(egui::FontId::new(12.0, theme::mono()))
-                                        .color(if *ok { theme::SUCCESS } else { theme::TEXT_DIM }),
-                                );
+                                let check = self.cfg.receiver.verified.get(*group);
+                                let (text, color, hover) = match (ok, check) {
+                                    (false, _) => ("no", theme::TEXT_DIM, None),
+                                    (true, Some(Check::NoAnswer)) => (
+                                        "yes?",
+                                        theme::WARNING,
+                                        Some("Listed for this model, but didn't answer when checked."),
+                                    ),
+                                    (true, Some(Check::NotNow)) => (
+                                        "yes",
+                                        theme::SUCCESS,
+                                        Some("Answered \"not available right now\" when checked."),
+                                    ),
+                                    (true, Some(Check::Works)) => {
+                                        ("yes", theme::SUCCESS, Some("Answered when checked."))
+                                    }
+                                    (true, None) => ("yes", theme::SUCCESS, None),
+                                };
+                                let resp = ui
+                                    .horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.label(
+                                            RichText::new(text)
+                                                .font(egui::FontId::new(12.0, theme::mono()))
+                                                .color(color),
+                                        );
+                                        if check == Some(&Check::Works) {
+                                            ui.label(
+                                                RichText::new(icon::CHECK)
+                                                    .size(11.0)
+                                                    .color(theme::SUCCESS),
+                                            );
+                                        }
+                                    })
+                                    .response;
+                                if let Some(h) = hover {
+                                    resp.on_hover_text(h);
+                                }
                                 col += 1;
                                 if col % 2 == 0 {
                                     ui.end_row();
                                 }
                             }
                         });
+                    self.verify_details(ui);
                 },
             );
             if detect {
                 self.start_probe(cols[0].ctx());
+            }
+            if verify {
+                self.start_verify(cols[0].ctx());
             }
 
             let current_input = self.receiver.ok().and_then(|s| s.input.clone());
@@ -3054,6 +3224,13 @@ impl eframe::App for SettingsApp {
             && let Some(Ok(caps)) = self.probe.result.clone()
         {
             self.apply_probe(&caps);
+        }
+        if self.verify.poll() {
+            match self.verify.result.take() {
+                Some(Ok(checks)) => self.apply_verify(checks),
+                Some(Err(e)) => self.set_status(format!("Check failed: {e}"), true),
+                None => {}
+            }
         }
         if !self.auto_probed
             && self.cfg.receiver.features.is_empty()
