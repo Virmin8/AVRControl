@@ -74,6 +74,7 @@ pub fn released() {
 }
 
 /// For platforms that always report releases, so the first hold repeats too.
+#[cfg(windows)]
 pub fn releases_reported() {
     RELEASE_SEEN.store(true, Ordering::SeqCst);
 }
