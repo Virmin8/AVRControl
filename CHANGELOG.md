@@ -23,7 +23,9 @@ All notable changes to AVR Control. Versions follow
   default, under General → Audio).
 - **Check on receiver** (Settings → Receiver → Setup): asks the receiver
   about every command its model should have, without changing anything, and
-  marks the ones that don't answer or aren't available right now.
+  marks the ones that don't answer or aren't available right now. Each of
+  those is listed with what it does and when the receiver answers it (e.g.
+  network playback info only while a network source plays).
 
 ### Changed
 - Reading the receiver's status is much quicker: all the questions go out

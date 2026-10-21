@@ -360,6 +360,159 @@ pub fn setting_info(group: &str) -> Option<&'static Setting> {
     SETTINGS.iter().find(|s| s.group == group)
 }
 
+/// Plain-language explanation of a command, for the results of "Check on
+/// receiver".
+pub struct CommandHelp {
+    pub name: String,
+    /// What it reports or controls.
+    pub what: Option<&'static str>,
+    /// When the receiver answers it, for commands that don't always.
+    pub when: Option<&'static str>,
+}
+
+/// What a command reports or controls, for the ones that often don't answer
+/// or whose spreadsheet name says little.
+const COMMAND_WHAT: &[(&str, &str)] = &[
+    (
+        "NAL",
+        "Album of the track playing from a network or USB source.",
+    ),
+    (
+        "NAT",
+        "Artist of the track playing from a network or USB source.",
+    ),
+    (
+        "NTI",
+        "Title of the track playing from a network or USB source.",
+    ),
+    (
+        "NTM",
+        "Elapsed and total time of the track playing from a network or USB source.",
+    ),
+    (
+        "NTR",
+        "Track number, out of how many, playing from a network or USB source.",
+    ),
+    (
+        "NST",
+        "Whether the network or USB source is playing, paused or stopped, and its repeat and shuffle mode.",
+    ),
+    (
+        "NMS",
+        "What the receiver's network/USB menu screen is showing, for remote-control apps.",
+    ),
+    (
+        "NLT",
+        "Title and position of the list shown while browsing a network or USB source.",
+    ),
+    (
+        "NJA",
+        "Album art of the track playing from a network or USB source.",
+    ),
+    (
+        "NDS",
+        "Whether the network is connected and a USB device is plugged in.",
+    ),
+    (
+        "NSB",
+        "Network standby: lets apps like this one turn the receiver on over the network.",
+    ),
+    ("NBS", "Turns the receiver's Bluetooth on or off."),
+    (
+        "ZHO",
+        "Whether zone 2 uses the receiver's HDMI output for zone 2, so a TV in a second room gets its own source.",
+    ),
+    ("ZPW", "Zone 2 power."),
+    ("ZMT", "Zone 2 mute."),
+    ("ZVL", "Zone 2 volume."),
+    ("ZTN", "Zone 2 bass and treble."),
+    ("ZBL", "Zone 2 left/right balance."),
+    ("SLZ", "Which input zone 2 plays."),
+    ("TUZ", "Tuner frequency for zone 2."),
+    ("PRZ", "Tuner preset for zone 2."),
+    ("PW3", "Zone 3 power."),
+    ("MT3", "Zone 3 mute."),
+    ("VL3", "Zone 3 volume."),
+    ("TN3", "Zone 3 bass and treble."),
+    ("BL3", "Zone 3 left/right balance."),
+    ("SL3", "Which input zone 3 plays."),
+    ("TU3", "Tuner frequency for zone 3."),
+    ("PR3", "Tuner preset for zone 3."),
+    (
+        "IFA",
+        "The audio coming in on the current input: connection, format, sample rate and channels.",
+    ),
+    (
+        "IFV",
+        "The video coming in on the current input and going out: resolution and colour format.",
+    ),
+    ("TUN", "The frequency the FM/AM tuner is on."),
+    ("PRS", "The tuner preset in use."),
+    ("TFR", "Bass and treble of the front speakers."),
+    (
+        "CTL",
+        "Centre speaker level (until the receiver is turned off).",
+    ),
+    ("SWL", "Subwoofer level (until the receiver is turned off)."),
+    (
+        "SPL",
+        "Which extra speakers are in use: surround back, front high, front wide or height speakers.",
+    ),
+    (
+        "DIF",
+        "What the front-panel display shows: the input with the volume or the listening mode, or briefly the audio or video format.",
+    ),
+    (
+        "SLA",
+        "Which audio connection the current input uses: auto, HDMI, coaxial/optical, analog or multichannel.",
+    ),
+    ("AVS", "Delays the sound to match the picture (A/V sync)."),
+    (
+        "CCM",
+        "Which HDMI output (main, sub or zone 2) the receiver's HDMI CEC control follows.",
+    ),
+];
+
+/// When a command answers, by family. None for ones that always should.
+fn command_when(group: &str) -> Option<&'static str> {
+    match group {
+        "IFA" | "IFV" => Some("Only answers while a signal is coming in on the current input."),
+        "NAL" | "NAT" | "NTI" | "NTM" | "NTR" | "NST" | "NMS" | "NLT" | "NJA" | "NTC" => Some(
+            "Only answers while a network or USB source is selected, and track details \
+             only while something plays. Doesn't mean it's broken.",
+        ),
+        "NBS" => Some(
+            "Only on models with Bluetooth; some answer only while the Bluetooth input is selected.",
+        ),
+        "TUN" | "PRS" => Some("Some models only answer while the tuner is the selected input."),
+        "ZHO" => Some(
+            "Usually needs zone 2 on, and the HDMI sub output assigned to zone 2 in the \
+             receiver's setup menu.",
+        ),
+        g if g.starts_with('Z') || g.ends_with('Z') => {
+            Some("Zone 2 setting: most only answer while zone 2 is on.")
+        }
+        g if g.ends_with('3') => Some("Zone 3 setting: most only answer while zone 3 is on."),
+        g if g.ends_with('4') => Some("Zone 4 setting: most only answer while zone 4 is on."),
+        _ => None,
+    }
+}
+
+pub fn command_help(group: &str) -> CommandHelp {
+    let name = FEATURES
+        .iter()
+        .find(|(g, _)| *g == group)
+        .map(|(_, l)| l.to_string())
+        .or_else(|| setting_info(group).map(|s| s.label.to_string()))
+        .or_else(|| lookup(crate::command_names::COMMAND_NAMES, group).map(str::to_string))
+        .unwrap_or_else(|| group.to_string());
+    CommandHelp {
+        name,
+        what: lookup(COMMAND_WHAT, group),
+        when: command_when(group),
+    }
+}
+
 fn lookup<'a>(table: &'a [(&str, &'a str)], code: &str) -> Option<&'a str> {
     table
         .iter()
@@ -1363,6 +1516,20 @@ mod tests {
         assert_eq!(default_input_name("05"), "VIDEO6 / PC");
         assert_eq!(default_input_name("2a"), "USB (rear)");
         assert_eq!(default_input_name("FF"), "Unknown input");
+    }
+
+    #[test]
+    fn every_command_has_a_name() {
+        let t = crate::models::lookup("DTR-50.7").unwrap();
+        for group in t.keys() {
+            assert_ne!(command_help(group).name, *group, "{group} has no name");
+        }
+        let h = command_help("ZHO");
+        assert_eq!(h.name, "Zone 2 HDMI out");
+        assert!(h.what.is_some() && h.when.is_some());
+        assert!(command_help("NAL").when.unwrap().contains("network"));
+        assert!(command_help("VL3").when.unwrap().contains("zone 3"));
+        assert_eq!(command_help("PWR").when, None);
     }
 
     #[test]

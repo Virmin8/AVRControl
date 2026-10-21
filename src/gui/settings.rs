@@ -296,6 +296,29 @@ fn optional_code(
     });
 }
 
+/// One command from a receiver check: its name and code, what it does and
+/// when the receiver answers it.
+fn explain_command(ui: &mut egui::Ui, group: &str) {
+    let help = eiscp::command_help(group);
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&help.name).strong().color(theme::TEXT));
+        ui.label(
+            RichText::new(group)
+                .font(egui::FontId::new(11.5, theme::mono()))
+                .color(theme::TEXT_DIM),
+        );
+    });
+    for (text, color) in [
+        (help.what, theme::TEXT_SECONDARY),
+        (help.when, theme::TEXT_DIM),
+    ] {
+        if let Some(text) = text {
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).wrap());
+        }
+    }
+}
+
 fn nonempty(s: &str) -> String {
     if s.trim().is_empty() {
         "–".to_string()
@@ -525,19 +548,11 @@ impl SettingsApp {
         if checks.is_empty() {
             return;
         }
-        let label = |group: &str| {
-            eiscp::FEATURES
-                .iter()
-                .find(|(g, _)| *g == group)
-                .map(|(_, l)| l.to_string())
-                .or_else(|| eiscp::setting_info(group).map(|s| s.label.to_string()))
-                .unwrap_or_else(|| group.to_string())
-        };
         let list = |c: Check| {
             checks
                 .iter()
                 .filter(|(_, v)| **v == c)
-                .map(|(g, _)| format!("{} ({g})", label(g)))
+                .map(|(g, _)| g.as_str())
                 .collect::<Vec<_>>()
         };
         let works = checks.values().filter(|v| **v == Check::Works).count();
@@ -545,46 +560,64 @@ impl SettingsApp {
         ui.add_space(8.0);
         ui.label(
             RichText::new(format!(
-                "Last check on the receiver: {works} of {} commands answered{}.",
+                "Last check on the receiver: {works} of {} commands answered{}{}.",
                 checks.len(),
                 if not_now.is_empty() {
                     String::new()
                 } else {
-                    format!(", {} more exist but weren't available then", not_now.len())
-                }
+                    format!(", {} weren't available at the time", not_now.len())
+                },
+                if none.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} didn't answer", none.len())
+                },
             ))
             .size(12.5)
             .color(theme::TEXT_SECONDARY),
         );
         if !none.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!("No answer: {}.", none.join(", ")))
-                        .size(12.5)
-                        .color(theme::WARNING),
-                )
-                .wrap(),
-            );
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "These may not work on this receiver, or only answer in another state \
-                         (network playback info only while a network source plays, zone \
-                         settings while the zone is on). They're still offered.",
+            egui::CollapsingHeader::new(
+                RichText::new(format!("Didn't answer ({})", none.len())).color(theme::WARNING),
+            )
+            .id_salt("verify_none")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "The receiver didn't reply to these. They may not work on this \
+                             model, or only reply in another state. They're still offered.",
+                        )
+                        .size(12.0)
+                        .color(theme::TEXT_DIM),
                     )
-                    .size(12.0)
-                    .color(theme::TEXT_DIM),
-                )
-                .wrap(),
-            );
+                    .wrap(),
+                );
+                for g in &none {
+                    explain_command(ui, g);
+                }
+            });
         }
         if !not_now.is_empty() {
-            ui.label(
-                RichText::new(format!("Not available then: {}.", not_now.join(", ")))
-                    .size(12.0)
-                    .color(theme::TEXT_DIM),
-            )
-            .on_hover_text("The receiver has these but said \"N/A\", e.g. a zone that was off.");
+            egui::CollapsingHeader::new(format!("Not available at the time ({})", not_now.len()))
+                .id_salt("verify_not_now")
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "The receiver has these, but answered \"not available\" \
+                                 when checked.",
+                            )
+                            .size(12.0)
+                            .color(theme::TEXT_DIM),
+                        )
+                        .wrap(),
+                    );
+                    for g in &not_now {
+                        explain_command(ui, g);
+                    }
+                });
         }
     }
 

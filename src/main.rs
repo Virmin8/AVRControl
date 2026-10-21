@@ -3,6 +3,7 @@
 
 mod audio;
 mod autostart;
+mod command_names;
 mod config;
 mod controller;
 mod daemon;
