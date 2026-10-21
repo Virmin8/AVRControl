@@ -135,18 +135,22 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_app_id(format!("{}.osd", crate::config::APP_ID))
+        .with_title("AVR Control volume")
+        .with_inner_size([340.0, 104.0])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_always_on_top()
+        .with_active(false);
+    // On Windows, winit makes the window layered for click-through, and a
+    // layered window doesn't show OpenGL output: the overlay comes up empty.
+    #[cfg(not(windows))]
+    let viewport = viewport.with_mouse_passthrough(true);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id(format!("{}.osd", crate::config::APP_ID))
-            .with_title("AVR Control volume")
-            .with_inner_size([340.0, 104.0])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_always_on_top()
-            .with_mouse_passthrough(true)
-            .with_active(false),
+        viewport,
         centered: true,
         ..Default::default()
     };
