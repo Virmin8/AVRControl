@@ -213,6 +213,8 @@ pub fn run(
     let map = Arc::new(Mutex::new(map));
     let hk_map = map.clone();
     let hk_tx = tx.clone();
+    // global-hotkey reports every release on Windows.
+    crate::repeat::releases_reported();
     GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| match e.state {
         HotKeyState::Pressed => {
             if let Some((id, repeatable)) = hk_map.lock().unwrap().get(&e.id) {

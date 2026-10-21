@@ -12,6 +12,8 @@ use crate::controller::Event;
 
 const INITIAL_DELAY: Duration = Duration::from_millis(350);
 const INTERVAL: Duration = Duration::from_millis(80);
+/// How often to check whether the previous repeat has been executed.
+const POLL: Duration = Duration::from_millis(5);
 /// Hard stop in case a release is ever missed.
 const MAX_HOLD: Duration = Duration::from_secs(10);
 
@@ -51,9 +53,13 @@ pub fn pressed(tx: &Sender<Event>, id: &str, repeatable: bool) {
         let start = Instant::now();
         thread::sleep(INITIAL_DELAY);
         while GENERATION.load(Ordering::SeqCst) == generation && start.elapsed() < MAX_HOLD {
-            if !IN_FLIGHT.swap(true, Ordering::SeqCst)
-                && tx.send(Event::Trigger(id.clone())).is_err()
-            {
+            // Still waiting on the receiver: check again shortly rather than
+            // skipping a whole interval, which halved the rate.
+            if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+                thread::sleep(POLL);
+                continue;
+            }
+            if tx.send(Event::Trigger(id.clone())).is_err() {
                 break;
             }
             thread::sleep(INTERVAL);
@@ -65,6 +71,11 @@ pub fn released() {
     *HELD.lock().unwrap() = None;
     RELEASE_SEEN.store(true, Ordering::SeqCst);
     GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// For platforms that always report releases, so the first hold repeats too.
+pub fn releases_reported() {
+    RELEASE_SEEN.store(true, Ordering::SeqCst);
 }
 
 /// Called by the controller after it has run a trigger.
