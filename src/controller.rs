@@ -137,11 +137,22 @@ pub struct Controller {
     /// (volume, muted) as last seen here, so the volume indicator only shows
     /// for updates that change them.
     heard: (Option<u8>, Option<bool>),
+    /// The volume is half a step above what the receiver reports. Receivers
+    /// that step by halves still report whole numbers, so this is worked out
+    /// from the replies to our own volume steps.
+    half: bool,
 }
 
 fn parse_volume(reply: &str) -> Option<u8> {
     let hex = reply.strip_prefix("MVL")?;
     u8::from_str_radix(hex.get(..2)?, 16).ok()
+}
+
+/// Whether a volume step landed on a half, from the reported volume before
+/// and after it. The receiver rounds down, so a step up that leaves the
+/// number unchanged, or a step down that lowers it, ends on a half.
+fn step_lands_on_half(up: bool, before: u8, after: u8) -> bool {
+    if up { after == before } else { after < before }
 }
 
 impl Controller {
@@ -164,6 +175,7 @@ impl Controller {
             monitors_busy: Default::default(),
             monitors_due: Instant::now(),
             heard: (None, None),
+            half: false,
         };
         c.receiver = c.make_receiver();
         c
@@ -399,12 +411,17 @@ impl Controller {
                 // Receivers repeat the volume when they power on, for example.
                 let now = (status.volume, status.muted);
                 let changed = self.heard.0.is_some() && now != self.heard;
+                if now.0 != self.heard.0 {
+                    // Changed on the receiver itself: the half is unknown.
+                    self.half = false;
+                }
                 self.heard = now;
                 if changed
                     && self.cfg.general.volume_osd_external
                     && let Some(v) = status.volume
                 {
-                    self.feedback.volume(v, status.muted == Some(true));
+                    self.feedback
+                        .volume(v, self.half, status.muted == Some(true));
                 }
             }
             Some("PWR") => crate::audio::set_receiver_power(Some(status.power_on)),
@@ -658,7 +675,8 @@ impl Controller {
                 }
                 if group == "MVL" {
                     if let Some(v) = parse_volume(&reply) {
-                        self.feedback.volume(v, false);
+                        self.half = false;
+                        self.feedback.volume(v, false, false);
                     }
                 } else if info.is_none_or(|i| i.notify) && !result.is_empty() {
                     let text = self.describe_setting(group, &result);
@@ -669,8 +687,9 @@ impl Controller {
             Action::SetVolume { level } => {
                 let raw = self.cfg.volume_raw(*level);
                 let reply = self.send(&format!("MVL{raw:02X}"))?.unwrap_or_default();
+                self.half = false;
                 self.feedback
-                    .volume(parse_volume(&reply).unwrap_or(raw), false);
+                    .volume(parse_volume(&reply).unwrap_or(raw), false, false);
                 Ok(())
             }
             Action::PowerToggle => {
@@ -691,17 +710,22 @@ impl Controller {
                 Ok(())
             }
             Action::VolumeUp | Action::VolumeDown => {
-                let cmd = if shortcut.action == Action::VolumeUp {
-                    "MVLUP"
-                } else {
-                    "MVLDOWN"
-                };
-                let reply = self.send(cmd)?.unwrap_or_default();
+                let up = shortcut.action == Action::VolumeUp;
+                let before = self.live.lock().unwrap().status.volume;
+                let reply = self
+                    .send(if up { "MVLUP" } else { "MVLDOWN" })?
+                    .unwrap_or_default();
                 let volume = match parse_volume(&reply) {
                     Some(v) => v,
                     None => self.current_volume()?,
                 };
-                self.feedback.volume(volume, false);
+                // At the top (or the volume limit) the number stops for
+                // another reason. Receivers set to half steps report them.
+                let top = self.cfg.volume_ceiling().unwrap_or(u8::MAX);
+                self.half = !self.cfg.receiver.volume_half_steps
+                    && volume < top.min(self.cfg.volume_max())
+                    && before.is_some_and(|b| step_lands_on_half(up, b, volume));
+                self.feedback.volume(volume, self.half, false);
                 Ok(())
             }
             Action::MuteToggle => {
@@ -709,7 +733,7 @@ impl Controller {
                 let muted = reply == "AMT01";
                 let volume = self.current_volume().ok();
                 match volume {
-                    Some(v) => self.feedback.volume(v, muted),
+                    Some(v) => self.feedback.volume(v, self.half, muted),
                     None => self.feedback.info(if muted { "Muted" } else { "Unmuted" }),
                 }
                 Ok(())
@@ -855,7 +879,24 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_volume;
+    use super::{parse_volume, step_lands_on_half};
+
+    /// Steps from 49.0 on a DTR-50.7, which reports only the whole part.
+    #[test]
+    fn half_steps_from_replies() {
+        let steps = [
+            (true, 49, 49, true),   // 49.5
+            (true, 49, 50, false),  // 50.0
+            (true, 50, 50, true),   // 50.5
+            (false, 50, 50, false), // 50.0
+            (false, 50, 49, true),  // 49.5
+            (false, 49, 49, false), // 49.0
+            (false, 49, 48, true),  // 48.5
+        ];
+        for (up, before, after, half) in steps {
+            assert_eq!(step_lands_on_half(up, before, after), half);
+        }
+    }
 
     #[test]
     fn volume_replies() {

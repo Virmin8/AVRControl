@@ -105,14 +105,17 @@ impl Feedback {
         }
     }
 
-    /// Shows the volume indicator for a raw `MVL` value.
-    pub fn volume(&mut self, raw: u8, muted: bool) {
+    /// Shows the volume indicator for a raw `MVL` value, `half` a step above
+    /// it when the receiver steps by halves but reports whole numbers.
+    pub fn volume(&mut self, raw: u8, half: bool, muted: bool) {
         if !self.volume_osd {
             return;
         }
         let (display, text) = if self.half_steps {
             let v = raw as f32 / 2.0;
             (v, format!("{v:.1}"))
+        } else if half {
+            (raw as f32 + 0.5, format!("{raw}.5"))
         } else {
             (raw as f32, raw.to_string())
         };
