@@ -37,19 +37,54 @@ struct Running {
     thread: JoinHandle<()>,
 }
 
+/// What should be playing: the settings, and whether the receiver is on
+/// (None when unknown, e.g. unreachable).
+struct Wanted {
+    settings: AudioConfig,
+    receiver_on: Option<bool>,
+}
+
+static WANTED: Mutex<Option<Wanted>> = Mutex::new(None);
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 
 /// Starts, stops or retargets the keep-alive to match the settings.
 pub fn apply(settings: &AudioConfig) {
+    let mut wanted = WANTED.lock().unwrap();
+    let receiver_on = wanted.as_ref().and_then(|w| w.receiver_on);
+    *wanted = Some(Wanted {
+        settings: settings.clone(),
+        receiver_on,
+    });
+    reconcile(wanted.as_ref().unwrap());
+}
+
+/// Tells the keep-alive whether the receiver is on, so it can pause while
+/// it's in standby.
+pub fn set_receiver_power(on: Option<bool>) {
+    let mut wanted = WANTED.lock().unwrap();
+    let Some(w) = wanted.as_mut() else {
+        return;
+    };
+    if w.receiver_on != on {
+        w.receiver_on = on;
+        reconcile(w);
+    }
+}
+
+fn reconcile(wanted: &Wanted) {
+    let settings = &wanted.settings;
+    let play =
+        settings.keep_alive && !(settings.pause_in_standby && wanted.receiver_on == Some(false));
     let mut guard = RUNNING.lock().unwrap();
-    if guard.as_ref().map(|r| &r.settings) == Some(settings) {
+    let current = guard.as_ref().map(|r| &r.settings);
+    if (play && current == Some(settings)) || (!play && current.is_none()) {
         return;
     }
     if let Some(r) = guard.take() {
         let _ = r.stop.send(());
         let _ = r.thread.join();
     }
-    if !settings.keep_alive {
+    if !play {
         return;
     }
     let (stop, stop_rx) = mpsc::channel();

@@ -19,6 +19,10 @@ hotkeys. It runs in the system tray on Linux (Wayland and X11) and Windows.
   network/USB playback, the receiver's on-screen menu, and zone 2/3 power,
   volume, mute and input.
 - Holding a volume, level, tuner or menu-arrow key repeats it.
+- An optional volume limit caps what shortcuts, the tray icon and the
+  settings window will set.
+- Media keys work too: bind `MediaPlayPause`, `MediaTrackNext` and so on to
+  the **Network / USB playback** setting.
 - Shortcuts are also in the tray menu and on the command line
   (`avrcontrol trigger <id>`).
 
@@ -54,9 +58,12 @@ hotkeys. It runs in the system tray on Linux (Wayland and X11) and Windows.
   video and audio signal, zones, and one-click input switching for every
   monitor.
 - The receiver's connection and power state show at the top of every page.
+- Updates live: changes made on the receiver, its remote or another app show
+  up within a second.
 - The tray tooltip shows the same at a glance.
-- Volume changes show a small front-panel style overlay. Actions show
-  desktop notifications.
+- Volume changes show a small front-panel style overlay, also for changes
+  made on the receiver or its remote. Actions show desktop notifications.
+- Scroll on the tray icon for volume (Linux), middle-click to mute.
 
 ### Desktop integration
 - Linux: Wayland and X11. Hotkeys go through the XDG Global Shortcuts portal
@@ -74,10 +81,10 @@ or running `avrcontrol` while the app is already running.
 | Tab | What it shows |
 | --- | --- |
 | Status | Live receiver state, input keys, the volume slider, video and audio signal, zones, and buttons to switch each monitor's input. |
-| Receiver | **Controls**: every supported function, grouped into power and volume, sound, HDMI, system and zones, plus raw commands. **Setup**: IP address (**Find on network** searches for it), connection test, volume steps, supported features, and renaming or hiding receiver inputs. |
+| Receiver | **Controls**: every supported function, grouped into power and volume, sound, HDMI, system and zones, plus raw commands. **Setup**: IP address (**Find on network** searches for it), connection test, volume steps and limit, supported features, and renaming or hiding receiver inputs. |
 | Monitors | Everything each connected display reports: graphics-card connector (e.g. `DP-1`), current input, signal, resolution, HDR, brightness and more. |
 | Shortcuts | Add, edit and reorder shortcuts. Set the hotkey (type it or press **Record**), then pick a receiver input and a target input for each monitor. |
-| General | Startup action, turning the receiver off at shutdown (only if it is still on the startup input), audio keep-alive and its output, notifications, volume indicator, start on login, and start/stop of the background service. |
+| General | Startup action, turning the receiver off at shutdown or sleep (only if it is still on the startup input), running the startup action again after sleep, audio keep-alive and its output, notifications, volume indicator, tray icon volume, start on login, and start/stop of the background service. |
 
 The configuration is stored in `~/.config/avrcontrol/config.toml` (Linux) or
 `%APPDATA%\avrcontrol\config\config.toml` (Windows).

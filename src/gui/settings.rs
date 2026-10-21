@@ -1095,6 +1095,12 @@ impl SettingsApp {
                     return;
                 }
                 let max = cfg.volume_max().max(1) as f32;
+                // Highest level the slider picks; the background service
+                // enforces the limit too.
+                let limit = match cfg.receiver.volume_limit {
+                    0 => max,
+                    l => (l as f32).min(max),
+                };
                 let current = st
                     .volume
                     .map(|v| {
@@ -1151,8 +1157,12 @@ impl SettingsApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
+                                    let range = match cfg.receiver.volume_limit {
+                                        0 => format!("max {}", cfg.volume_max()),
+                                        l => format!("limit {l} · max {}", cfg.volume_max()),
+                                    };
                                     ui.label(
-                                        RichText::new(format!("max {}", cfg.volume_max()))
+                                        RichText::new(range)
                                             .font(egui::FontId::new(12.0, theme::mono()))
                                             .color(theme::TEXT_DIM),
                                     );
@@ -1170,7 +1180,7 @@ impl SettingsApp {
                         {
                             let f =
                                 ((pos.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
-                            let level = (f * max / step).round() * step;
+                            let level = ((f * max / step).round() * step).min(limit);
                             if (level - shown).abs() > 0.01 {
                                 self.volume_want = Some(level);
                             }
@@ -1186,7 +1196,7 @@ impl SettingsApp {
                             while self.slider_scroll.abs() >= NOTCH {
                                 let dir = self.slider_scroll.signum();
                                 let base = self.volume_want.unwrap_or(shown);
-                                self.volume_want = Some((base + dir * step).clamp(0.0, max));
+                                self.volume_want = Some((base + dir * step).clamp(0.0, limit));
                                 self.slider_scroll -= NOTCH * dir;
                             }
                         } else {
@@ -1859,6 +1869,25 @@ impl SettingsApp {
                             "The volume (as shown on the receiver) that fills the volume bar.",
                         );
                     ui.add(egui::DragValue::new(&mut self.cfg.receiver.max_volume).range(1..=200));
+                    ui.end_row();
+
+                    ui.label(RichText::new("Volume limit").color(theme::TEXT_SECONDARY))
+                        .on_hover_text(
+                            "The highest volume shortcuts, the tray icon and this window will \
+                             set. The receiver's own knob and remote aren't limited.",
+                        );
+                    let volume_max = self.cfg.volume_max();
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.receiver.volume_limit)
+                            .range(0..=volume_max)
+                            .custom_formatter(|v, _| {
+                                if v == 0.0 {
+                                    "Off".into()
+                                } else {
+                                    format!("{v:.0}")
+                                }
+                            }),
+                    );
                     ui.end_row();
                 });
                 ui.add_space(4.0);
@@ -2742,6 +2771,30 @@ impl SettingsApp {
                             .on_disabled_hover_text(
                                 "Needs a startup action that switches the receiver's input.",
                             );
+                        let label = match &startup_input {
+                            Some(input) => format!(
+                                "Turn the receiver off when this PC sleeps, if it's still on {input}"
+                            ),
+                            None => "Turn the receiver off when this PC sleeps".into(),
+                        };
+                        ui.checkbox(&mut self.cfg.general.sleep_power_off, label)
+                            .on_hover_text(
+                                "Left on if you've switched to another input (a console, a TV box).",
+                            )
+                            .on_disabled_hover_text(
+                                "Needs a startup action that switches the receiver's input.",
+                            );
+                    });
+                    let has_startup = self.cfg.shortcut(&self.cfg.general.startup_shortcut).is_some();
+                    ui.add_enabled_ui(has_startup, |ui| {
+                        ui.checkbox(
+                            &mut self.cfg.general.wake_startup,
+                            "Run the startup action again when this PC wakes from sleep",
+                        )
+                        .on_hover_text(
+                            "Skipped while the receiver is on and in use on another input.",
+                        )
+                        .on_disabled_hover_text("Needs a startup action.");
                     });
                     ui.add_space(6.0);
                     ui.checkbox(
@@ -2752,6 +2805,20 @@ impl SettingsApp {
                         &mut self.cfg.general.volume_osd,
                         "Show an on-screen volume indicator",
                     );
+                    ui.add_enabled_ui(self.cfg.general.volume_osd, |ui| {
+                        ui.indent("osd_external", |ui| {
+                            ui.checkbox(
+                                &mut self.cfg.general.volume_osd_external,
+                                "Also when the volume is changed on the receiver or its remote",
+                            );
+                        });
+                    });
+                    let tray_label = if cfg!(windows) {
+                        "Middle-click the tray icon to mute"
+                    } else {
+                        "Scroll on the tray icon for volume, middle-click to mute"
+                    };
+                    ui.checkbox(&mut self.cfg.general.tray_volume, tray_label);
                     if ui
                         .checkbox(&mut self.autostart, "Start AVR Control when I log in")
                         .changed()
@@ -2874,6 +2941,10 @@ impl SettingsApp {
                      doesn't cut off the start of sounds after a quiet moment.",
                 );
                 ui.add_enabled_ui(self.cfg.audio.keep_alive, |ui| {
+                    ui.checkbox(
+                        &mut self.cfg.audio.pause_in_standby,
+                        "Pause while the receiver is in standby",
+                    );
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Output").color(theme::TEXT_SECONDARY));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2947,18 +3018,20 @@ impl eframe::App for SettingsApp {
         self.update_check.poll();
         self.audio_devices.poll();
         self.monitor_test.poll();
-        // Keep the status live while the Receiver tab is showing (the probe
-        // uses its own connection, so wait for it to finish first).
-        // Keep the status live (faster on the pages that show it).
-        let interval = if matches!(self.tab, Tab::Status | Tab::Receiver) {
-            5
-        } else {
-            15
+        // Keep the status live, faster on the pages that show it. The
+        // background service answers from what the receiver last told it,
+        // so asking it often is cheap; on our own connection it's a full read.
+        let live_page = matches!(self.tab, Tab::Status | Tab::Receiver);
+        let interval = match (live_page, self.daemon_running) {
+            (true, true) => Duration::from_secs(1),
+            (true, false) => Duration::from_secs(5),
+            _ => Duration::from_secs(15),
         };
+        // (The probe uses its own connection, so wait for it to finish first.)
         if self.receiver.result.is_some()
             && !self.receiver.running()
             && !self.probe.running()
-            && self.status_at.elapsed() > Duration::from_secs(interval)
+            && self.status_at.elapsed() > interval
         {
             self.refresh_receiver(ui.ctx());
         }
@@ -2998,7 +3071,8 @@ impl eframe::App for SettingsApp {
             self.daemon_running = ipc::is_running();
             self.daemon_checked = Instant::now();
         }
-        ui.ctx().request_repaint_after(Duration::from_secs(2));
+        ui.ctx()
+            .request_repaint_after(interval.min(Duration::from_secs(2)));
 
         egui::Panel::left("rail")
             .exact_size(64.0)

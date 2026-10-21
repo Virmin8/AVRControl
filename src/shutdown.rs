@@ -36,10 +36,21 @@ fn try_power_off() -> anyhow::Result<bool> {
     if !cfg.general.shutdown_power_off || cfg.receiver.host.trim().is_empty() {
         return Ok(false);
     }
+    if cfg.startup_input().is_none() {
+        return Ok(false);
+    }
+    let mut receiver = Receiver::new(&cfg.receiver.host, cfg.receiver.port);
+    let off = off_if_on_startup_input(&mut receiver, &cfg)?;
+    receiver.disconnect();
+    Ok(off)
+}
+
+/// Turns the receiver off if it's on and still on the startup shortcut's
+/// input. Used at shutdown and when going to sleep.
+pub fn off_if_on_startup_input(receiver: &mut Receiver, cfg: &Config) -> anyhow::Result<bool> {
     let Some(input) = cfg.startup_input() else {
         return Ok(false);
     };
-    let mut receiver = Receiver::new(&cfg.receiver.host, cfg.receiver.port);
     if receiver.query("PWR")? != "01" || !receiver.query("SLI")?.eq_ignore_ascii_case(input) {
         return Ok(false);
     }
@@ -47,18 +58,32 @@ fn try_power_off() -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// True if the receiver is in standby or on the startup shortcut's input,
+/// i.e. nothing else is using it. False when there is no startup input.
+pub fn on_startup_input_or_off(receiver: &mut Receiver, cfg: &Config) -> anyhow::Result<bool> {
+    let Some(input) = cfg.startup_input() else {
+        return Ok(false);
+    };
+    if receiver.query("PWR")? != "01" {
+        return Ok(true);
+    }
+    Ok(receiver.query("SLI")?.eq_ignore_ascii_case(input))
+}
+
 #[cfg(target_os = "linux")]
-pub use linux::{start_watcher, watch};
+pub use linux::{start_watcher, watch, watch_sleep};
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, Sender};
 
     use anyhow::{Result, anyhow};
     use zbus::blocking::proxy::SignalIterator;
 
     use crate::config::APP_NAME;
+    use crate::controller::Event;
 
     const UNIT: &str = "avrcontrol-shutdown";
 
@@ -124,6 +149,42 @@ mod linux {
         }
     }
 
+    /// Tells the controller when the PC goes to sleep (holding a "delay"
+    /// inhibitor until it has dealt with the receiver) and when it wakes up.
+    /// Runs on its own thread for as long as the app does.
+    pub fn watch_sleep(tx: Sender<Event>) {
+        std::thread::spawn(move || {
+            if let Err(e) = watch_sleep_inner(&tx) {
+                eprintln!("sleep watcher: {e:#}");
+            }
+        });
+    }
+
+    fn watch_sleep_inner(tx: &Sender<Event>) -> Result<()> {
+        let conn = zbus::blocking::Connection::system()?;
+        let logind: zbus::blocking::Proxy = zbus::blocking::proxy::Builder::new(&conn)
+            .destination("org.freedesktop.login1")?
+            .path("/org/freedesktop/login1")?
+            .interface("org.freedesktop.login1.Manager")?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()?;
+        let mut signals = logind.receive_signal("PrepareForSleep")?;
+        loop {
+            let lock: zbus::zvariant::OwnedFd = logind.call(
+                "Inhibit",
+                &("sleep", APP_NAME, "Turning off the receiver", "delay"),
+            )?;
+            // PrepareForSleep(true) going to sleep, (false) after waking.
+            while !next(&mut signals)? {}
+            let (done, wait) = mpsc::channel();
+            tx.send(Event::Sleep(done))?;
+            let _ = wait.recv_timeout(super::MAX_WAIT);
+            drop(lock);
+            while next(&mut signals)? {}
+            tx.send(Event::Resume)?;
+        }
+    }
+
     fn next(signals: &mut SignalIterator) -> Result<bool> {
         let msg = signals
             .next()
@@ -138,8 +199,8 @@ mod linux {
         use std::collections::HashMap;
         use zbus::zvariant::OwnedValue;
 
-        let Ok(meta) = logind
-            .get_property::<HashMap<String, OwnedValue>>("PreparingForShutdownWithMetadata")
+        let Ok(meta) =
+            logind.get_property::<HashMap<String, OwnedValue>>("PreparingForShutdownWithMetadata")
         else {
             return false;
         };

@@ -4,8 +4,12 @@
 //! | version (u8, 1) | 3 reserved bytes | data. Data is "!1<CMD><PARAM>\r";
 //! the receiver answers with "!1<CMD><PARAM>\x1a\r\n".
 
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -437,14 +441,142 @@ fn take_packet(buf: &mut Vec<u8>) -> Option<String> {
     Some(msg)
 }
 
+/// What a `Receiver`'s listener is told about.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Push<'a> {
+    /// A message from the receiver. `solicited` is true when it answers a
+    /// command we were waiting on; false for status updates the receiver
+    /// sends by itself (front panel, remote, another app, signal changes).
+    Message { msg: &'a str, solicited: bool },
+    /// The receiver closed the connection (not when we closed it).
+    Closed,
+}
+
+/// Called from the connection's reader thread for every message.
+pub type Listener = Arc<dyn Fn(Push) + Send + Sync>;
+
+/// How many queries `query_batch` keeps in flight at once.
+const BATCH_WINDOW: usize = 6;
+/// Per-query timeout for optional status fields.
+const OPTIONAL_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// One open TCP connection. A reader thread owns the reading side: it hands
+/// replies we're waiting for to `replies` and everything else to the
+/// listener, so status updates arrive even while nothing is being sent.
+struct Conn {
+    stream: TcpStream,
+    replies: mpsc::Receiver<String>,
+    /// Command groups currently waiting for a reply.
+    awaiting: Arc<Mutex<HashMap<String, usize>>>,
+    /// Set before we close the connection ourselves, so it isn't reported.
+    closing: Arc<AtomicBool>,
+    /// Cleared by the reader thread when the connection goes away.
+    alive: Arc<AtomicBool>,
+}
+
+impl Conn {
+    fn open(addr: SocketAddr, listener: Option<Listener>) -> Result<Conn> {
+        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            .with_context(|| format!("connecting to {addr}"))?;
+        stream.set_nodelay(true).ok();
+        let mut reader = stream.try_clone()?;
+        let (tx, replies) = mpsc::channel();
+        let awaiting: Arc<Mutex<HashMap<String, usize>>> = Default::default();
+        let closing = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (wanted, closed, up) = (awaiting.clone(), closing.clone(), alive.clone());
+        thread::Builder::new()
+            .name("eiscp-reader".into())
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = match reader.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    while let Some(msg) = take_packet(&mut buf) {
+                        let group = msg.get(..3).unwrap_or(&msg);
+                        let solicited = wanted.lock().unwrap().contains_key(group);
+                        if let Some(l) = &listener {
+                            l(Push::Message {
+                                msg: &msg,
+                                solicited,
+                            });
+                        }
+                        if solicited && tx.send(msg).is_err() {
+                            return;
+                        }
+                    }
+                }
+                up.store(false, Ordering::SeqCst);
+                if !closed.load(Ordering::SeqCst)
+                    && let Some(l) = &listener
+                {
+                    l(Push::Closed);
+                }
+            })?;
+        Ok(Conn {
+            stream,
+            replies,
+            awaiting,
+            closing,
+            alive,
+        })
+    }
+
+    fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn expect(&self, group: &str) {
+        *self
+            .awaiting
+            .lock()
+            .unwrap()
+            .entry(group.to_string())
+            .or_default() += 1;
+    }
+
+    fn done(&self, group: &str) {
+        let mut awaiting = self.awaiting.lock().unwrap();
+        if let Some(n) = awaiting.get_mut(group) {
+            *n -= 1;
+            if *n == 0 {
+                awaiting.remove(group);
+            }
+        }
+    }
+
+    /// Drops replies that arrived after their command had timed out.
+    fn drain(&self) {
+        while self.replies.try_recv().is_ok() {}
+    }
+
+    /// Next reply, Ok(None) once `deadline` passes.
+    fn next(&self, deadline: Instant) -> Result<Option<String>> {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match self.replies.recv_timeout(wait) {
+            Ok(msg) => Ok(Some(msg)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("connection closed by receiver"),
+        }
+    }
+}
+
 pub struct Receiver {
     host: String,
     port: u16,
     /// Command groups known to be unsupported (from feature detection);
     /// status() doesn't ask for them.
-    unsupported: std::collections::HashSet<String>,
-    stream: Option<TcpStream>,
-    buf: Vec<u8>,
+    unsupported: HashSet<String>,
+    /// Command groups known to be supported: a status query that goes
+    /// unanswered for one of these is asked again on its own.
+    supported: HashSet<String>,
+    conn: Option<Conn>,
+    listener: Option<Listener>,
 }
 
 impl Receiver {
@@ -453,30 +585,28 @@ impl Receiver {
             host: host.trim().to_string(),
             port,
             unsupported: Default::default(),
-            stream: None,
-            buf: Vec::new(),
+            supported: Default::default(),
+            conn: None,
+            listener: None,
         }
     }
 
     pub fn set_features(&mut self, features: &std::collections::BTreeMap<String, bool>) {
-        self.unsupported = features
-            .iter()
-            .filter(|(_, ok)| !**ok)
-            .map(|(g, _)| g.clone())
-            .collect();
+        let pick = |want: bool| {
+            features
+                .iter()
+                .filter(|(_, ok)| **ok == want)
+                .map(|(g, _)| g.clone())
+                .collect()
+        };
+        self.unsupported = pick(false);
+        self.supported = pick(true);
     }
 
-    /// Like `query`, but with a short timeout and None for "N/A", for
-    /// optional status fields.
-    fn query_optional(&mut self, group: &str) -> Option<String> {
-        if self.unsupported.contains(group) {
-            return None;
-        }
-        let reply = self
-            .exchange(&format!("{group}QSTN"), Duration::from_millis(1200))
-            .ok()??;
-        let value = reply.get(3..)?.to_string();
-        (value != "N/A" && !value.is_empty()).then_some(value)
+    /// Receives every message from now on, including the status updates the
+    /// receiver sends by itself. Takes effect from the next connection.
+    pub fn set_listener(&mut self, listener: Listener) {
+        self.listener = Some(listener);
     }
 
     pub fn host(&self) -> &str {
@@ -484,7 +614,9 @@ impl Receiver {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.stream.is_some()
+        self.conn
+            .as_ref()
+            .is_some_and(|c| c.alive.load(Ordering::SeqCst))
     }
 
     fn addr(&self) -> Result<SocketAddr> {
@@ -501,93 +633,65 @@ impl Receiver {
     pub fn connect(&mut self) -> Result<()> {
         self.disconnect();
         let addr = self.addr()?;
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-            .with_context(|| format!("connecting to {addr}"))?;
-        stream.set_nodelay(true).ok();
-        self.stream = Some(stream);
+        self.conn = Some(Conn::open(addr, self.listener.clone())?);
         Ok(())
     }
 
     pub fn disconnect(&mut self) {
-        if let Some(s) = self.stream.take() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+        if let Some(c) = self.conn.take() {
+            c.close();
         }
-        self.buf.clear();
     }
 
-    fn ensure_connected(&mut self) -> Result<()> {
-        if self.stream.is_none() {
+    fn conn(&mut self) -> Result<&Conn> {
+        if !self.is_connected() {
             self.connect()?;
         }
-        Ok(())
-    }
-
-    /// Reads the next message, or Ok(None) once `deadline` passes.
-    fn read_message(&mut self, deadline: Instant) -> Result<Option<String>> {
-        loop {
-            if let Some(msg) = take_packet(&mut self.buf) {
-                return Ok(Some(msg));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
-            let stream = self
-                .stream
-                .as_mut()
-                .ok_or_else(|| anyhow!("not connected"))?;
-            stream.set_read_timeout(Some((deadline - now).max(Duration::from_millis(1))))?;
-            let mut chunk = [0u8; 4096];
-            match stream.read(&mut chunk) {
-                Ok(0) => bail!("connection closed by receiver"),
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    return Ok(None);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        Ok(self.conn.as_ref().unwrap())
     }
 
     /// Sends one command and waits for the reply with the same 3-letter
     /// command group (e.g. "MVLUP" is answered by "MVL2A").
     fn exchange(&mut self, command: &str, timeout: Duration) -> Result<Option<String>> {
-        self.ensure_connected()?;
-        // Discard unsolicited status updates that piled up since last time,
-        // so they are not mistaken for the answer.
-        let drain_deadline = Instant::now() + Duration::from_millis(2);
-        while self.read_message(drain_deadline)?.is_some() {}
-
-        let stream = self.stream.as_mut().unwrap();
-        stream.write_all(&packet(&format!("!1{command}\r")))?;
-
-        let group = command.get(..3).unwrap_or(command);
-        let deadline = Instant::now() + timeout;
-        while let Some(msg) = self.read_message(deadline)? {
-            if msg.starts_with(group) {
-                return Ok(Some(msg));
+        let group = command.get(..3).unwrap_or(command).to_string();
+        let conn = self.conn()?;
+        conn.drain();
+        conn.expect(&group);
+        let result = (|| {
+            (&conn.stream).write_all(&packet(&format!("!1{command}\r")))?;
+            let deadline = Instant::now() + timeout;
+            while let Some(msg) = conn.next(deadline)? {
+                if msg.starts_with(&group) {
+                    return Ok(Some(msg));
+                }
             }
+            Ok(None)
+        })();
+        conn.done(&group);
+        if result.is_err() {
+            self.disconnect();
         }
-        Ok(None)
+        result
     }
 
     /// Sends a command and returns the receiver's reply (None if it did not
     /// answer in time). A dropped connection is re-opened and the command
-    /// retried once: Onkyo receivers close idle eISCP connections.
+    /// retried: Onkyo receivers close idle eISCP connections.
     pub fn send(&mut self, command: &str) -> Result<Option<String>> {
         let command = command.trim().to_ascii_uppercase();
+        Self::retrying(|| self.exchange(&command, RESPONSE_TIMEOUT))
+    }
+
+    /// Runs `f` up to three times, reconnecting in between.
+    fn retrying<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
         let mut last_err = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 // The receiver drops idle connections, and some models only
                 // allow one client: give a competing client a moment.
                 std::thread::sleep(Duration::from_millis(300 * attempt));
-                if let Err(e) = self.connect() {
-                    last_err = Some(e);
-                    continue;
-                }
             }
-            match self.exchange(&command, RESPONSE_TIMEOUT) {
+            match f() {
                 Ok(r) => return Ok(r),
                 Err(e) => last_err = Some(e),
             }
@@ -602,6 +706,91 @@ impl Receiver {
             .send(&format!("{group}QSTN"))?
             .ok_or_else(|| anyhow!("receiver did not answer {group}QSTN"))?;
         Ok(reply.get(3..).unwrap_or("").to_string())
+    }
+
+    /// Asks for several groups at once, keeping a few queries in flight
+    /// instead of waiting for each reply in turn. Returns the replies that
+    /// arrived (full messages, e.g. "MVL2A"); unanswered groups are missing.
+    /// Groups known to be unsupported aren't asked.
+    pub fn query_batch(&mut self, groups: &[&str]) -> Result<HashMap<String, String>> {
+        let groups: Vec<&str> = groups
+            .iter()
+            .copied()
+            .filter(|g| !self.unsupported.contains(*g))
+            .collect();
+        let mut replies = Self::retrying(|| {
+            let r = self.batch_once(&groups, OPTIONAL_TIMEOUT);
+            if r.is_err() {
+                self.disconnect();
+            }
+            r
+        })?;
+        // Commands the receiver is known to have but didn't answer may have
+        // been dropped in the rush; ask those once more on their own.
+        let missed: Vec<&str> = groups
+            .iter()
+            .copied()
+            .filter(|g| !replies.contains_key(*g) && self.supported.contains(*g))
+            .collect();
+        for g in missed {
+            if let Ok(Some(msg)) = self.exchange(&format!("{g}QSTN"), OPTIONAL_TIMEOUT) {
+                replies.insert(g.to_string(), msg);
+            }
+        }
+        Ok(replies)
+    }
+
+    fn batch_once(
+        &mut self,
+        groups: &[&str],
+        timeout: Duration,
+    ) -> Result<HashMap<String, String>> {
+        let conn = self.conn()?;
+        conn.drain();
+        let mut queue = groups.iter().copied();
+        let mut in_flight: Vec<(&str, Instant)> = Vec::new();
+        let mut replies = HashMap::new();
+        let result = (|| {
+            loop {
+                let mut out = Vec::new();
+                while in_flight.len() < BATCH_WINDOW
+                    && let Some(g) = queue.next()
+                {
+                    conn.expect(g);
+                    out.extend(packet(&format!("!1{g}QSTN\r")));
+                    in_flight.push((g, Instant::now() + timeout));
+                }
+                if !out.is_empty() {
+                    (&conn.stream).write_all(&out)?;
+                }
+                let Some(deadline) = in_flight.iter().map(|(_, d)| *d).min() else {
+                    return Ok(());
+                };
+                match conn.next(deadline)? {
+                    Some(msg) => {
+                        if let Some(i) = in_flight.iter().position(|(g, _)| msg.starts_with(g)) {
+                            let (g, _) = in_flight.remove(i);
+                            conn.done(g);
+                            replies.insert(g.to_string(), msg);
+                        }
+                    }
+                    None => {
+                        let now = Instant::now();
+                        in_flight.retain(|(g, d)| {
+                            let keep = *d > now;
+                            if !keep {
+                                conn.done(g);
+                            }
+                            keep
+                        });
+                    }
+                }
+            }
+        })();
+        for (g, _) in in_flight {
+            conn.done(g);
+        }
+        result.map(|()| replies)
     }
 
     /// Asks the receiver about every entry in FEATURES. Unsupported commands
@@ -637,7 +826,7 @@ impl Receiver {
             let wait = if *group == "NRI" {
                 Duration::from_secs(3)
             } else {
-                Duration::from_millis(1200)
+                OPTIONAL_TIMEOUT
             };
             let reply = match self.exchange(&format!("{group}QSTN"), wait) {
                 Ok(r) => r,
@@ -669,39 +858,22 @@ impl Receiver {
         Ok(caps)
     }
 
-    /// Current state, one query per field. Fields the receiver doesn't
+    /// Current state, asked for all at once. Fields the receiver doesn't
     /// support (or can't report while in standby) are None.
     pub fn status(&mut self) -> Result<ReceiverStatus> {
-        let power = self.query("PWR")?;
-        let mut q = |group: &str| self.query_optional(group);
-        let input = q("SLI");
-        let volume = q("MVL").and_then(|v| u8::from_str_radix(v.get(..2).unwrap_or(&v), 16).ok());
-        let muted = q("AMT").map(|m| m == "01");
-        let listening_mode = q("LMD");
-        let hdmi_output = q("HDO");
-        let video = q("IFV").and_then(|v| VideoInfo::parse(&v));
-        let audio_raw = q("IFA");
-        let audio = audio_raw
-            .as_deref()
-            .map(|v| v.trim_end_matches(',').replace(',', ", "));
-        let audio_info = audio_raw.as_deref().and_then(AudioInfo::parse);
-        let extra = EXTRA_STATUS
-            .iter()
-            .filter_map(|g| Some((g.to_string(), q(g)?)))
-            .collect();
-        Ok(ReceiverStatus {
-            model: None,
-            power_on: power == "01",
-            input,
-            volume,
-            muted,
-            listening_mode,
-            hdmi_output,
-            video,
-            audio,
-            audio_info,
-            extra,
-        })
+        let groups: Vec<&str> = STATUS_GROUPS.iter().chain(EXTRA_STATUS).copied().collect();
+        let mut replies = self.query_batch(&groups)?;
+        if !replies.contains_key("PWR") {
+            // Power is the one field every receiver answers; without it the
+            // connection is no good. Ask once more the slow way.
+            let power = self.query("PWR")?;
+            replies.insert("PWR".into(), format!("PWR{power}"));
+        }
+        let mut status = ReceiverStatus::default();
+        for msg in replies.values() {
+            status.apply(msg);
+        }
+        Ok(status)
     }
 
     /// `status()` plus the model name (an extra UDP round-trip).
@@ -804,6 +976,9 @@ pub struct ReceiverStatus {
     pub extra: std::collections::BTreeMap<String, String>,
 }
 
+/// The main status fields, asked for by `Receiver::status`.
+pub const STATUS_GROUPS: &[&str] = &["PWR", "SLI", "MVL", "AMT", "LMD", "HDO", "IFV", "IFA"];
+
 /// Additional settings read for the control panel.
 pub const EXTRA_STATUS: &[&str] = &[
     "HAO", "HAS", "LTN", "DIM", "SLP", "CEC", "AEQ", "MOT", "SLA", "TGA", "TGB", "TGC", "ZPW",
@@ -891,6 +1066,45 @@ impl VideoInfo {
 }
 
 impl ReceiverStatus {
+    /// Updates the field a message reports on, e.g. "MVL2A" sets the volume.
+    /// Returns false for messages that aren't part of the status.
+    pub fn apply(&mut self, msg: &str) -> bool {
+        let (Some(group), Some(value)) = (msg.get(..3), msg.get(3..)) else {
+            return false;
+        };
+        let value = (value != "N/A" && !value.is_empty()).then(|| value.to_string());
+        match group {
+            "PWR" => {
+                if let Some(v) = value {
+                    self.power_on = v == "01";
+                }
+            }
+            "SLI" => self.input = value,
+            "MVL" => {
+                self.volume =
+                    value.and_then(|v| u8::from_str_radix(v.get(..2).unwrap_or(&v), 16).ok())
+            }
+            "AMT" => self.muted = value.map(|m| m == "01"),
+            "LMD" => self.listening_mode = value,
+            "HDO" => self.hdmi_output = value,
+            "IFV" => self.video = value.as_deref().and_then(VideoInfo::parse),
+            "IFA" => {
+                self.audio_info = value.as_deref().and_then(AudioInfo::parse);
+                self.audio = value.map(|v| v.trim_end_matches(',').replace(',', ", "));
+            }
+            g if EXTRA_STATUS.contains(&g) => match value {
+                Some(v) => {
+                    self.extra.insert(g.to_string(), v);
+                }
+                None => {
+                    self.extra.remove(g);
+                }
+            },
+            _ => return false,
+        }
+        true
+    }
+
     /// Multi-line summary for the tray tooltip.
     pub fn summary(&self, cfg: &crate::config::Config) -> String {
         if !self.power_on {
@@ -1022,6 +1236,9 @@ pub fn identify(host: &str, port: u16) -> Option<DiscoveredReceiver> {
 }
 
 #[cfg(test)]
+mod fake;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1056,6 +1273,96 @@ mod tests {
         assert_eq!(take_packet(&mut buf).as_deref(), Some("PWR01"));
         assert_eq!(take_packet(&mut buf).as_deref(), Some("SLI05"));
         assert_eq!(take_packet(&mut buf), None);
+    }
+
+    #[test]
+    fn packet_header_is_byte_exact() {
+        assert_eq!(
+            packet("!1PWRQSTN\r"),
+            b"ISCP\0\0\0\x10\0\0\0\x0a\x01\0\0\0!1PWRQSTN\r"
+        );
+    }
+
+    #[test]
+    fn take_packet_edge_cases() {
+        // No magic at all: keep only a possible start of one.
+        let mut buf = b"xxxxxxISC".to_vec();
+        assert_eq!(take_packet(&mut buf), None);
+        assert_eq!(buf, b"ISC");
+        // A header claiming to be shorter than 16 bytes is read as 16.
+        let mut bad = packet("!1PWR01\r");
+        bad[4..8].copy_from_slice(&4u32.to_be_bytes());
+        assert_eq!(take_packet(&mut bad).as_deref(), Some("PWR01"));
+        // Terminators and the "!1" prefix are stripped in every combination.
+        assert_eq!(parse_message(b"!1MVL2A\x1a\r\n"), "MVL2A");
+        assert_eq!(parse_message(b"!1MVL2A\r"), "MVL2A");
+        assert_eq!(parse_message(b"MVL2A\0"), "MVL2A");
+    }
+
+    #[test]
+    fn info_parsers_reject_empty() {
+        assert_eq!(AudioInfo::parse(""), None);
+        assert_eq!(AudioInfo::parse(",,,,,,"), None);
+        let v = VideoInfo::parse("HDMI 2,3840x2160 60Hz,YCbCr,10bit").unwrap();
+        assert_eq!(v.output_port, "");
+        assert_eq!(v.input_format, "3840x2160 60Hz YCbCr 10bit");
+    }
+
+    #[test]
+    fn names() {
+        assert_eq!(listening_mode_name("0C"), "All Ch Stereo");
+        assert_eq!(listening_mode_name("up"), listening_mode_name("UP"));
+        assert_eq!(listening_mode_name("ZZ"), "Mode ZZ");
+        assert_eq!(hdmi_output_name("04"), "Both (main)");
+        assert_eq!(hdmi_output_name("77"), "Output 77");
+        assert_eq!(default_input_name("05"), "VIDEO6 / PC");
+        assert_eq!(default_input_name("2a"), "USB (rear)");
+        assert_eq!(default_input_name("FF"), "Unknown input");
+    }
+
+    #[test]
+    fn status_apply() {
+        let mut s = ReceiverStatus::default();
+        assert!(s.apply("PWR01"));
+        assert!(s.power_on);
+        assert!(s.apply("MVL3A"));
+        assert_eq!(s.volume, Some(0x3A));
+        assert!(s.apply("AMT01"));
+        assert_eq!(s.muted, Some(true));
+        assert!(s.apply("SLI05"));
+        assert!(s.apply("DIM01"));
+        assert_eq!(s.extra.get("DIM").map(String::as_str), Some("01"));
+        assert!(s.apply("IFA HDMI 1,PCM,48 kHz,2.0 ch,"));
+        assert!(s.audio.as_deref().unwrap().contains(", PCM"));
+        // N/A clears a field, but never turns the power off.
+        assert!(s.apply("SLIN/A"));
+        assert_eq!(s.input, None);
+        assert!(s.apply("DIMN/A"));
+        assert!(!s.extra.contains_key("DIM"));
+        assert!(s.apply("PWRN/A"));
+        assert!(s.power_on);
+        assert!(s.apply("PWR00"));
+        assert!(!s.power_on);
+        assert!(!s.apply("NRI<xml/>"));
+        assert!(!s.apply("X"));
+    }
+
+    #[test]
+    fn status_summary() {
+        let mut cfg = crate::config::Config::default();
+        cfg.receiver
+            .input_names
+            .insert("05".into(), "Desktop".into());
+        cfg.receiver.volume_half_steps = true;
+        let mut s = ReceiverStatus::default();
+        assert_eq!(s.summary(&cfg), "Receiver in standby");
+        for m in ["PWR01", "SLI05", "MVL33", "AMT01", "LMD0C"] {
+            s.apply(m);
+        }
+        assert_eq!(
+            s.summary(&cfg),
+            "Input: Desktop\nVolume: 25.5 (muted)\nMode: All Ch Stereo"
+        );
     }
 
     #[test]

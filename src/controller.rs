@@ -2,27 +2,53 @@
 //! thread and is driven by `Event`s from hotkeys, the tray and IPC.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver as Rx, RecvTimeoutError};
+use std::sync::mpsc::{Receiver as Rx, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{Action, Config, Shortcut};
-use crate::eiscp::Receiver;
+use crate::eiscp::{Push, Receiver, ReceiverStatus};
 use crate::feedback::Feedback;
 use crate::monitors;
 
-/// How often an idle connection is poked so the receiver doesn't drop it.
+/// How often the full status is read. This also keeps the connection from
+/// being dropped by the receiver.
 const KEEPALIVE: Duration = Duration::from_secs(30);
 /// Quiet period after an action before the tray status is refreshed.
 const STATUS_DELAY: Duration = Duration::from_millis(700);
+/// How long a full status read stays good enough to answer the settings
+/// window from. In between, updates the receiver sends keep it current.
+const STATUS_FRESH: Duration = Duration::from_secs(10);
+/// How often the monitors' inputs are read for the tray tooltip (DDC/CI
+/// traffic), besides shortly after a shortcut switched them.
+const MONITORS_REFRESH: Duration = Duration::from_secs(300);
+/// How long after a monitor switch its input is read again: monitors don't
+/// answer DDC/CI while they switch.
+const MONITORS_SETTLE: Duration = Duration::from_secs(5);
+/// How long to wait before asking again for a model name that couldn't be
+/// found out.
+const MODEL_RETRY: Duration = Duration::from_secs(300);
+/// How long to wait for the network after waking from sleep.
+const WAKE_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub enum Event {
     Trigger(String),
+    /// An action without a shortcut, e.g. scrolling on the tray icon.
+    Run(Action),
     Reload,
     Reconnect,
     Quit,
+    /// A status update the receiver sent by itself, e.g. "MVL2A" when the
+    /// volume knob was turned.
+    Pushed(String),
+    /// The receiver closed the connection.
+    Disconnected,
+    /// The PC is about to sleep; answered once the receiver is dealt with.
+    Sleep(Sender<()>),
+    /// The PC woke up from sleep.
+    Resume,
     /// A question from the settings window, answered as JSON. Goes through
     /// the controller so only one connection to the receiver is open (some
     /// models drop the older connection when a second client connects).
@@ -42,6 +68,18 @@ pub enum QueryKind {
     Command(String),
 }
 
+/// Set while a tray action is queued, so fast scrolling can't build up a
+/// backlog of volume steps.
+static TRAY_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Queues an action from the tray icon unless the previous one is still
+/// waiting to run.
+pub fn tray_action(tx: &Sender<Event>, action: Action) {
+    if !TRAY_PENDING.swap(true, Ordering::SeqCst) && tx.send(Event::Run(action)).is_err() {
+        TRAY_PENDING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Callbacks into the platform layer (tray + hotkeys).
 pub struct Hooks {
     pub on_reload: Box<dyn Fn(&Config) + Send>,
@@ -52,24 +90,46 @@ pub struct Hooks {
     pub on_update: Arc<dyn Fn(Option<String>) + Send + Sync>,
 }
 
+/// The receiver's state as last seen: from the last full read, kept up to
+/// date by every message the receiver sends.
+#[derive(Default)]
+struct Live {
+    status: ReceiverStatus,
+    /// When the last full read finished; None until one has on this
+    /// connection.
+    read_at: Option<Instant>,
+}
+
 pub struct Controller {
     cfg: Config,
     /// True while the startup shortcut runs: monitors already on their
     /// target input are left alone instead of being switched again.
     starting: bool,
     receiver: Receiver,
+    /// Our own event queue, for the receiver's status updates.
+    tx: Sender<Event>,
+    live: Arc<Mutex<Live>>,
     feedback: Feedback,
     hooks: Hooks,
     /// Last known reachability, so we notify on changes rather than repeatedly.
     online: Option<bool>,
-    /// Receiver model, looked up once per connection for the tooltip.
+    /// Receiver model for the tooltip and the settings window.
     model: Option<String>,
+    /// When the model was last asked for over the network.
+    model_asked: Option<Instant>,
     /// An action ran since the tray status was last refreshed.
     status_stale: bool,
+    /// A status update arrived since the tooltip was last published.
+    tooltip_stale: bool,
     /// Tooltip parts: (receiver lines, monitor lines). The monitor part is
     /// filled in by a background thread so DDC reads never delay hotkeys.
     tooltip: Arc<Mutex<(String, String)>>,
     monitors_busy: Arc<AtomicBool>,
+    /// When the monitor part of the tooltip is due for a refresh.
+    monitors_due: Instant,
+    /// (volume, muted) as last seen here, so the volume indicator only shows
+    /// for updates that change them.
+    heard: (Option<u8>, Option<bool>),
 }
 
 fn parse_volume(reply: &str) -> Option<u8> {
@@ -78,34 +138,56 @@ fn parse_volume(reply: &str) -> Option<u8> {
 }
 
 impl Controller {
-    pub fn new(cfg: Config, hooks: Hooks) -> Self {
-        Self {
+    pub fn new(cfg: Config, hooks: Hooks, tx: Sender<Event>) -> Self {
+        let live: Arc<Mutex<Live>> = Default::default();
+        let mut c = Self {
             starting: false,
-            receiver: {
-                let mut r = Receiver::new(&cfg.receiver.host, cfg.receiver.port);
-                r.set_features(&cfg.effective_features());
-                r
-            },
+            receiver: Receiver::new("", 0),
+            tx,
+            live,
             feedback: Feedback::new(&cfg),
             cfg,
             hooks,
             online: None,
             model: None,
+            model_asked: None,
             status_stale: true,
+            tooltip_stale: false,
             tooltip: Default::default(),
             monitors_busy: Default::default(),
-        }
+            monitors_due: Instant::now(),
+            heard: (None, None),
+        };
+        c.receiver = c.make_receiver();
+        c
+    }
+
+    /// A receiver for the configured address whose messages update `live`
+    /// and whose own status updates come back to us as events.
+    fn make_receiver(&self) -> Receiver {
+        let mut r = Receiver::new(&self.cfg.receiver.host, self.cfg.receiver.port);
+        r.set_features(&self.cfg.effective_features());
+        let live = self.live.clone();
+        let tx = self.tx.clone();
+        r.set_listener(Arc::new(move |push| match push {
+            Push::Message { msg, solicited } => {
+                live.lock().unwrap().status.apply(msg);
+                if !solicited {
+                    let _ = tx.send(Event::Pushed(msg.to_string()));
+                }
+            }
+            Push::Closed => {
+                live.lock().unwrap().read_at = None;
+                let _ = tx.send(Event::Disconnected);
+            }
+        }));
+        r
     }
 
     pub fn run(mut self, events: Rx<Event>) {
         if self.has_receiver() {
             self.connect();
-            let startup = self.cfg.general.startup_shortcut.clone();
-            if !startup.is_empty() {
-                self.starting = true;
-                self.trigger(&startup);
-                self.starting = false;
-            }
+            self.run_startup();
         } else {
             self.feedback
                 .info("No receiver configured yet. Open Settings from the tray icon.");
@@ -114,7 +196,7 @@ impl Controller {
         loop {
             // After an action, refresh the status once things go quiet (not
             // between steps of a held volume key).
-            let wait = if self.status_stale {
+            let wait = if self.status_stale || self.tooltip_stale {
                 STATUS_DELAY
             } else {
                 KEEPALIVE
@@ -124,6 +206,19 @@ impl Controller {
                     self.trigger(&id);
                     crate::repeat::executed();
                     self.status_stale = true;
+                    self.heard_now();
+                }
+                Ok(Event::Run(action)) => {
+                    TRAY_PENDING.store(false, Ordering::SeqCst);
+                    let shortcut = Shortcut {
+                        id: String::new(),
+                        name: Action::kind_label(action.kind()).to_string(),
+                        hotkey: String::new(),
+                        action,
+                    };
+                    self.run_shortcut(&shortcut);
+                    self.status_stale = true;
+                    self.heard_now();
                 }
                 Ok(Event::Query {
                     kind,
@@ -133,11 +228,29 @@ impl Controller {
                 }) => {
                     let _ =
                         reply.send(self.answer(kind, &host, port).map_err(|e| format!("{e:#}")));
+                    self.heard_now();
                 }
+                Ok(Event::Pushed(msg)) => self.pushed(&msg),
+                // Reconnected by the next command or status read, at the
+                // latest with the next keepalive; not straight away, so a
+                // competing client on a one-connection model isn't kicked off.
+                Ok(Event::Disconnected) => {}
+                Ok(Event::Sleep(done)) => {
+                    self.sleep();
+                    let _ = done.send(());
+                }
+                Ok(Event::Resume) => self.resume(),
                 Ok(Event::Reload) => self.reload(),
                 Ok(Event::Reconnect) => self.connect(),
                 Ok(Event::Quit) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => self.keepalive(),
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.tooltip_stale && !self.status_stale {
+                        self.tooltip_stale = false;
+                        self.publish_live();
+                    } else {
+                        self.keepalive();
+                    }
+                }
             }
         }
         self.receiver.disconnect();
@@ -146,6 +259,15 @@ impl Controller {
 
     fn has_receiver(&self) -> bool {
         !self.cfg.receiver.host.trim().is_empty()
+    }
+
+    fn run_startup(&mut self) {
+        let startup = self.cfg.general.startup_shortcut.clone();
+        if !startup.is_empty() {
+            self.starting = true;
+            self.trigger(&startup);
+            self.starting = false;
+        }
     }
 
     fn set_online(&mut self, online: bool, detail: &str) {
@@ -164,46 +286,108 @@ impl Controller {
     }
 
     fn connect(&mut self) {
+        self.live.lock().unwrap().read_at = None;
         match self.receiver.connect() {
             Ok(()) => self.set_online(true, ""),
             Err(e) => self.set_online(false, &format!("{e:#}")),
         }
     }
 
+    /// The receiver's model: from the settings when known, otherwise asked
+    /// for over the network (not more than every few minutes if it fails).
+    fn model(&mut self) -> Option<String> {
+        if self.model.is_none() && !self.cfg.receiver.model.is_empty() {
+            self.model = Some(self.cfg.receiver.model.clone());
+        }
+        if self.model.is_none() && self.model_asked.is_none_or(|t| t.elapsed() > MODEL_RETRY) {
+            self.model_asked = Some(Instant::now());
+            self.model = crate::eiscp::identify(&self.cfg.receiver.host, self.cfg.receiver.port)
+                .map(|r| r.model);
+        }
+        self.model.clone()
+    }
+
+    /// Reads the full status, remembering it in `live`.
+    fn read_status(&mut self) -> anyhow::Result<ReceiverStatus> {
+        let mut status = self.receiver.status()?;
+        status.model = self.model();
+        let mut live = self.live.lock().unwrap();
+        live.status = status.clone();
+        live.read_at = Some(Instant::now());
+        drop(live);
+        self.heard = (status.volume, status.muted);
+        crate::audio::set_receiver_power(Some(status.power_on));
+        Ok(status)
+    }
+
     fn answer(&mut self, kind: QueryKind, host: &str, port: u16) -> anyhow::Result<String> {
         let same = host.trim() == self.cfg.receiver.host.trim() && port == self.cfg.receiver.port;
-        let mut temp;
-        let receiver = if same {
-            &mut self.receiver
-        } else {
-            // Settings is testing an address that hasn't been saved yet.
-            temp = Receiver::new(host, port);
-            &mut temp
-        };
-        let json = match kind {
-            QueryKind::Status => {
-                let mut status = receiver.status()?;
-                status.model = if same && self.model.is_some() {
-                    self.model.clone()
-                } else {
-                    crate::eiscp::identify(host, port).map(|r| r.model)
-                };
-                if same {
-                    self.model = status.model.clone();
+        if same {
+            let json = match kind {
+                QueryKind::Status => {
+                    let cached = {
+                        let live = self.live.lock().unwrap();
+                        live.read_at
+                            .filter(|t| t.elapsed() < STATUS_FRESH && self.receiver.is_connected())
+                            .map(|_| live.status.clone())
+                    };
+                    let status = match cached {
+                        Some(mut s) => {
+                            s.model = self.model();
+                            s
+                        }
+                        None => self.read_status()?,
+                    };
                     self.set_online(true, "");
+                    serde_json::to_string(&status)?
                 }
-                serde_json::to_string(&status)?
-            }
-            QueryKind::Probe => serde_json::to_string(&receiver.probe()?)?,
-            QueryKind::Command(cmd) => {
-                let reply = receiver.send(&cmd)?;
-                if same {
+                QueryKind::Probe => serde_json::to_string(&self.receiver.probe()?)?,
+                QueryKind::Command(cmd) => {
+                    let reply = self.send(&cmd)?;
                     self.status_stale = true;
+                    serde_json::to_string(&reply)?
                 }
-                serde_json::to_string(&reply)?
-            }
+            };
+            return Ok(json);
+        }
+        // Settings is testing an address that hasn't been saved yet.
+        let mut receiver = Receiver::new(host, port);
+        let json = match kind {
+            QueryKind::Status => serde_json::to_string(&receiver.status_with_model()?)?,
+            QueryKind::Probe => serde_json::to_string(&receiver.probe()?)?,
+            QueryKind::Command(cmd) => serde_json::to_string(&receiver.send(&cmd)?)?,
         };
+        receiver.disconnect();
         Ok(json)
+    }
+
+    /// Remembers the current volume and mute as seen, after our own changes.
+    fn heard_now(&mut self) {
+        let live = self.live.lock().unwrap();
+        self.heard = (live.status.volume, live.status.muted);
+    }
+
+    /// A status update the receiver sent by itself (already applied to
+    /// `live` by the listener).
+    fn pushed(&mut self, msg: &str) {
+        self.tooltip_stale = true;
+        let status = self.live.lock().unwrap().status.clone();
+        match msg.get(..3) {
+            Some("MVL" | "AMT") => {
+                // Receivers repeat the volume when they power on, for example.
+                let now = (status.volume, status.muted);
+                let changed = self.heard.0.is_some() && now != self.heard;
+                self.heard = now;
+                if changed
+                    && self.cfg.general.volume_osd_external
+                    && let Some(v) = status.volume
+                {
+                    self.feedback.volume(v, status.muted == Some(true));
+                }
+            }
+            Some("PWR") => crate::audio::set_receiver_power(Some(status.power_on)),
+            _ => {}
+        }
     }
 
     fn publish(tooltip: &Mutex<(String, String)>, hook: &(dyn Fn(String) + Send + Sync)) {
@@ -216,13 +400,15 @@ impl Controller {
         hook(text);
     }
 
-    /// Updates the receiver part of the tooltip and kicks off a monitor refresh.
+    /// Updates the receiver part of the tooltip, and the monitor part when
+    /// it's due.
     fn set_receiver_status(&mut self, text: String) {
         self.tooltip.lock().unwrap().0 = text;
         Self::publish(&self.tooltip, &*self.hooks.on_status);
-        if self.monitors_busy.swap(true, Ordering::SeqCst) {
+        if Instant::now() < self.monitors_due || self.monitors_busy.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.monitors_due = Instant::now() + MONITORS_REFRESH;
         let tooltip = self.tooltip.clone();
         let hook = self.hooks.on_status.clone();
         let busy = self.monitors_busy.clone();
@@ -234,10 +420,26 @@ impl Controller {
         });
     }
 
+    fn status_text(&mut self, status: &ReceiverStatus) -> String {
+        let title = match self.model() {
+            Some(m) => format!("Onkyo {m}"),
+            None => "Onkyo receiver".into(),
+        };
+        format!("{title}\n{}", status.summary(&self.cfg))
+    }
+
+    /// Tooltip from what the receiver has told us, without asking it.
+    fn publish_live(&mut self) {
+        let status = self.live.lock().unwrap().status.clone();
+        let text = self.status_text(&status);
+        self.set_receiver_status(text);
+    }
+
     /// Runs on idle: refreshes the tray status, which also keeps the
     /// connection from being dropped by the receiver.
     fn keepalive(&mut self) {
         self.status_stale = false;
+        self.tooltip_stale = false;
         if !self.has_receiver() {
             self.set_receiver_status("No receiver configured".into());
             return;
@@ -246,22 +448,15 @@ impl Controller {
             self.set_receiver_status(format!("Receiver unreachable ({})", self.receiver.host()));
             return;
         }
-        match self.receiver.status() {
+        match self.read_status() {
             Ok(status) => {
-                if self.model.is_none() {
-                    self.model =
-                        crate::eiscp::identify(&self.cfg.receiver.host, self.cfg.receiver.port)
-                            .map(|r| r.model);
-                }
-                let title = match &self.model {
-                    Some(m) => format!("Onkyo {m}"),
-                    None => "Onkyo receiver".into(),
-                };
-                self.set_receiver_status(format!("{title}\n{}", status.summary(&self.cfg)));
+                let text = self.status_text(&status);
+                self.set_receiver_status(text);
             }
             Err(_) => {
                 // Quietly drop it; the next command reconnects on demand.
                 self.receiver.disconnect();
+                crate::audio::set_receiver_power(None);
                 self.set_receiver_status("Receiver not responding".into());
             }
         }
@@ -285,10 +480,12 @@ impl Controller {
         self.receiver.set_features(&self.cfg.effective_features());
         if receiver_changed {
             self.receiver.disconnect();
-            self.receiver = Receiver::new(&self.cfg.receiver.host, self.cfg.receiver.port);
-            self.receiver.set_features(&self.cfg.effective_features());
+            self.receiver = self.make_receiver();
+            *self.live.lock().unwrap() = Live::default();
+            crate::audio::set_receiver_power(None);
             self.online = None;
             self.model = None;
+            self.model_asked = None;
             self.status_stale = true;
             if self.has_receiver() {
                 self.connect();
@@ -297,12 +494,60 @@ impl Controller {
         self.feedback.info("Settings reloaded");
     }
 
+    /// The PC is going to sleep: turn the receiver off if that's wanted and
+    /// nothing else is using it, then let go of the connection, which won't
+    /// survive the sleep anyway.
+    fn sleep(&mut self) {
+        if self.cfg.general.sleep_power_off && self.has_receiver() {
+            match crate::shutdown::off_if_on_startup_input(&mut self.receiver, &self.cfg) {
+                Ok(true) => eprintln!("sleep: receiver turned off"),
+                Ok(false) => eprintln!("sleep: receiver left alone"),
+                Err(e) => eprintln!("sleep: {e:#}"),
+            }
+        }
+        self.receiver.disconnect();
+        *self.live.lock().unwrap() = Live::default();
+    }
+
+    /// Back from sleep: reconnect, and run the startup shortcut again if
+    /// that's wanted and the receiver isn't in use on another input.
+    fn resume(&mut self) {
+        self.status_stale = true;
+        self.monitors_due = Instant::now() + MONITORS_SETTLE;
+        // Without the startup action, reconnect lazily: waiting here would
+        // hold up hotkeys while the network comes back.
+        if !self.has_receiver() || !self.cfg.general.wake_startup {
+            return;
+        }
+        // The network usually takes a few seconds to come back.
+        let until = Instant::now() + WAKE_WAIT;
+        while self.receiver.connect().is_err() && Instant::now() < until {
+            thread::sleep(Duration::from_secs(2));
+        }
+        if !self.receiver.is_connected() {
+            eprintln!("wake: receiver unreachable, startup action skipped");
+            return;
+        }
+        let free = self.cfg.startup_input().is_none()
+            || crate::shutdown::on_startup_input_or_off(&mut self.receiver, &self.cfg)
+                .unwrap_or(false);
+        if free {
+            self.run_startup();
+        } else {
+            eprintln!("wake: receiver is in use on another input, left alone");
+        }
+    }
+
     fn trigger(&mut self, id: &str) {
         let Some(shortcut) = self.cfg.shortcut(id).cloned() else {
             self.feedback.error(&format!("Unknown shortcut \"{id}\""));
             return;
         };
-        if let Err(e) = self.execute(&shortcut) {
+        self.run_shortcut(&shortcut);
+    }
+
+    fn run_shortcut(&mut self, shortcut: &Shortcut) {
+        if let Err(e) = self.execute(shortcut) {
             let msg = format!("{}: {e:#}", shortcut.name);
             if self.receiver.is_connected() {
                 self.feedback.error(&msg);
@@ -312,11 +557,47 @@ impl Controller {
         }
     }
 
-    /// Sends a command, recording reachability for the notifications.
+    /// Sends a command, recording reachability for the notifications and
+    /// keeping volume changes under the volume limit.
     fn send(&mut self, cmd: &str) -> anyhow::Result<Option<String>> {
-        let r = self.receiver.send(cmd)?;
+        let cmd = cmd.trim().to_ascii_uppercase();
+        let ceiling = self.cfg.volume_ceiling();
+        let mut cmd = cmd.as_str();
+        let clamped;
+        if let (Some(max), Some(arg)) = (ceiling, cmd.strip_prefix("MVL")) {
+            if matches!(arg, "UP" | "UP1") && self.current_volume()? >= max {
+                // Already at the limit: answer as if the receiver had.
+                return Ok(Some(format!("MVL{max:02X}")));
+            }
+            if arg.len() == 2
+                && let Ok(v) = u8::from_str_radix(arg, 16)
+                && v > max
+            {
+                clamped = format!("MVL{max:02X}");
+                cmd = &clamped;
+            }
+        }
+        let mut r = self.receiver.send(cmd)?;
         self.set_online(true, "");
+        // A volume step can be bigger than one, so it may overshoot.
+        if let Some(max) = ceiling
+            && cmd.starts_with("MVLUP")
+            && r.as_deref().and_then(parse_volume).is_some_and(|v| v > max)
+        {
+            r = self.receiver.send(&format!("MVL{max:02X}"))?;
+        }
         Ok(r)
+    }
+
+    /// Raw volume: as last reported by the receiver, or asked for.
+    fn current_volume(&mut self) -> anyhow::Result<u8> {
+        if let Some(v) = self.live.lock().unwrap().status.volume
+            && self.receiver.is_connected()
+        {
+            return Ok(v);
+        }
+        let reply = self.receiver.query("MVL")?;
+        Ok(u8::from_str_radix(reply.get(..2).unwrap_or("0"), 16)?)
     }
 
     fn execute(&mut self, shortcut: &Shortcut) -> anyhow::Result<()> {
@@ -395,9 +676,7 @@ impl Controller {
                 let reply = self.send(cmd)?.unwrap_or_default();
                 let volume = match parse_volume(&reply) {
                     Some(v) => v,
-                    None => {
-                        u8::from_str_radix(self.receiver.query("MVL")?.get(..2).unwrap_or("0"), 16)?
-                    }
+                    None => self.current_volume()?,
                 };
                 self.feedback.volume(volume, false);
                 Ok(())
@@ -405,11 +684,7 @@ impl Controller {
             Action::MuteToggle => {
                 let reply = self.send("AMTTG")?.unwrap_or_default();
                 let muted = reply == "AMT01";
-                let volume = self
-                    .receiver
-                    .query("MVL")
-                    .ok()
-                    .and_then(|v| u8::from_str_radix(v.get(..2)?, 16).ok());
+                let volume = self.current_volume().ok();
                 match volume {
                     Some(v) => self.feedback.volume(v, muted),
                     None => self.feedback.info(if muted { "Muted" } else { "Unmuted" }),
@@ -485,6 +760,9 @@ impl Controller {
         // Monitors are switched on a separate thread so DDC/CI latency
         // overlaps with the network round-trips to the receiver.
         let mut targets = targets.to_vec();
+        if !targets.is_empty() {
+            self.monitors_due = Instant::now() + MONITORS_SETTLE;
+        }
         let starting = self.starting;
         let monitor_job = thread::spawn(move || {
             if starting && !targets.is_empty() {
@@ -549,5 +827,18 @@ impl Controller {
         }
         self.feedback.info(&shortcut.name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_volume;
+
+    #[test]
+    fn volume_replies() {
+        assert_eq!(parse_volume("MVL3A"), Some(0x3A));
+        assert_eq!(parse_volume("MVLN/A"), None);
+        assert_eq!(parse_volume("MVL3"), None);
+        assert_eq!(parse_volume("AMT01"), None);
     }
 }

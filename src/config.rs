@@ -28,6 +28,9 @@ pub struct ReceiverConfig {
     pub port: u16,
     /// Volume (as shown on the receiver) that corresponds to a full bar in the OSD.
     pub max_volume: u8,
+    /// Highest volume (as shown on the receiver) that shortcuts, the tray
+    /// and the settings window will set. 0 = no limit.
+    pub volume_limit: u8,
     /// Some receivers count volume in 0.5 steps: `MVL` 0x33 (51) is shown as
     /// 25.5. Most (e.g. the DTR-50.7) show the raw value.
     pub volume_half_steps: bool,
@@ -54,13 +57,23 @@ pub struct GeneralConfig {
     /// At shutdown, turn the receiver off if it is still on the startup
     /// shortcut's input (left alone on any other input, e.g. a console).
     pub shutdown_power_off: bool,
+    /// Same as `shutdown_power_off`, when the PC goes to sleep.
+    pub sleep_power_off: bool,
+    /// After waking from sleep, run the startup shortcut again (unless the
+    /// receiver is on and in use on another input).
+    pub wake_startup: bool,
     pub notifications: bool,
     pub volume_osd: bool,
+    /// Also show the volume indicator when the volume is changed on the
+    /// receiver itself, its remote or another app.
+    pub volume_osd_external: bool,
+    /// Scrolling on the tray icon changes the volume; middle-click mutes.
+    pub tray_volume: bool,
     /// Look for a new release on GitHub (at launch and every 48 hours).
     pub check_updates: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AudioConfig {
     /// Play an inaudible signal to the receiver's audio output so the HDMI
@@ -69,6 +82,18 @@ pub struct AudioConfig {
     /// Output to keep alive: PulseAudio/PipeWire sink name on Linux, endpoint
     /// name on Windows. Empty = the default output.
     pub device: String,
+    /// Stop while the receiver is in standby.
+    pub pause_in_standby: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            keep_alive: false,
+            device: String::new(),
+            pause_in_standby: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -272,6 +297,7 @@ impl Default for ReceiverConfig {
             host: String::new(),
             port: crate::eiscp::DEFAULT_PORT,
             max_volume: 100,
+            volume_limit: 0,
             volume_half_steps: false,
             model: String::new(),
             features_source: String::new(),
@@ -287,8 +313,12 @@ impl Default for GeneralConfig {
         Self {
             startup_shortcut: "pc".into(),
             shutdown_power_off: false,
+            sleep_power_off: false,
+            wake_startup: false,
             notifications: true,
             volume_osd: true,
+            volume_osd_external: true,
+            tray_volume: true,
             check_updates: true,
         }
     }
@@ -398,6 +428,11 @@ impl Config {
         }
     }
 
+    /// Raw `MVL` value of the volume limit, if one is set.
+    pub fn volume_ceiling(&self) -> Option<u8> {
+        (self.receiver.volume_limit > 0).then(|| self.volume_raw(self.receiver.volume_limit))
+    }
+
     /// Command table for the receiver's model from the protocol spreadsheet.
     pub fn model_table(&self) -> Option<&'static crate::models::ModelTable> {
         crate::models::lookup(&self.receiver.model)
@@ -479,5 +514,127 @@ impl Config {
             Some(name) if !name.is_empty() => name.clone(),
             _ => crate::eiscp::default_input_name(code).to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_round_trip() {
+        let cfg = Config::default();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), cfg);
+    }
+
+    /// A config as 1.0 wrote it: no audio section, none of the later
+    /// settings. It must still load, with the new settings at their defaults.
+    #[test]
+    fn old_config_loads() {
+        let cfg: Config =
+            toml::from_str(include_str!("../tests/fixtures/config-1.0.toml")).unwrap();
+        assert_eq!(cfg.receiver.host, "192.168.1.50");
+        assert_eq!(cfg.receiver.volume_limit, 0);
+        assert!(!cfg.general.shutdown_power_off);
+        assert!(!cfg.general.sleep_power_off);
+        assert!(cfg.general.tray_volume);
+        assert!(cfg.general.volume_osd_external);
+        assert!(!cfg.audio.keep_alive);
+        assert!(cfg.audio.pause_in_standby);
+        assert_eq!(cfg.shortcuts.len(), 2);
+        assert_eq!(cfg.startup_input(), Some("05"));
+        assert_eq!(
+            cfg.shortcut("pc").map(|s| &s.action),
+            Some(&Action::Switch {
+                receiver_input: Some("05".into()),
+                power_on: true,
+                hdmi_output: None,
+                listening_mode: None,
+                volume: None,
+                extra_commands: vec!["HAO00".into()],
+                monitors: vec![MonitorTarget {
+                    monitor: MonitorId {
+                        mfg: "DEL".into(),
+                        model: "DELL S3220DGF".into(),
+                        serial: String::new(),
+                    },
+                    input: 0x0f,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn volume_scales() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.volume_raw(40), 40);
+        assert_eq!(cfg.volume_text(40), "40");
+        assert_eq!(cfg.volume_ceiling(), None);
+        cfg.receiver.volume_limit = 60;
+        assert_eq!(cfg.volume_ceiling(), Some(60));
+        cfg.receiver.volume_half_steps = true;
+        assert_eq!(cfg.volume_raw(40), 80);
+        assert_eq!(cfg.volume_raw(200), 255);
+        assert_eq!(cfg.volume_text(51), "25.5");
+        assert_eq!(cfg.volume_ceiling(), Some(120));
+        assert_eq!(cfg.volume_max(), 100);
+    }
+
+    #[test]
+    fn features_from_table_or_probe() {
+        let mut cfg = Config::default();
+        // Nothing known: everything counts as supported.
+        assert!(cfg.supports("DIM"));
+        assert!(cfg.supports_value("DIM", "03"));
+        cfg.receiver.features.insert("DIM".into(), false);
+        assert!(!cfg.supports("DIM"));
+        assert!(!cfg.supports_kind("power_on") || cfg.supports("PWR"));
+        // A known model uses the spreadsheet, whatever probing said.
+        cfg.receiver.model = "DTR-50.7".into();
+        assert!(cfg.supports("DIM"));
+        assert!(cfg.supports_value("DIM", "02"));
+        assert!(!cfg.supports_value("DIM", "03"));
+        assert!(!cfg.supports("RES"));
+        assert_eq!(cfg.effective_features().get("RES"), Some(&false));
+        assert_eq!(cfg.effective_features().get("DIM"), Some(&true));
+        assert_eq!(cfg.volume_max(), 100);
+    }
+
+    #[test]
+    fn inputs() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.startup_input(), Some("05"));
+        assert_eq!(cfg.input_label("05"), "VIDEO6 / PC");
+        cfg.receiver
+            .input_names
+            .insert("05".into(), "Desktop".into());
+        cfg.receiver.input_names.insert("10".into(), String::new());
+        assert_eq!(cfg.input_label("05"), "Desktop");
+        assert_eq!(cfg.input_label("10"), "BD/DVD");
+        cfg.general.startup_shortcut = "power".into();
+        assert_eq!(cfg.startup_input(), None);
+        cfg.general.startup_shortcut = "missing".into();
+        assert_eq!(cfg.startup_input(), None);
+    }
+
+    #[test]
+    fn action_kinds() {
+        for (kind, _) in Action::KINDS {
+            assert_eq!(Action::from_kind(kind).kind(), *kind);
+            assert_ne!(Action::kind_label(kind), "?");
+        }
+        assert!(Action::VolumeUp.repeatable());
+        assert!(Action::VolumeDown.repeatable());
+        assert!(!Action::MuteToggle.repeatable());
+        let setting = |group: &str, value: &str| Action::Setting {
+            group: group.into(),
+            value: value.into(),
+        };
+        assert!(setting("MVL", "UP1").repeatable());
+        assert!(setting("TUN", "UP").repeatable());
+        assert!(setting("OSD", "LEFT").repeatable());
+        assert!(!setting("OSD", "ENTER").repeatable());
+        assert!(!setting("AMT", "TG").repeatable());
     }
 }

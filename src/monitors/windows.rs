@@ -306,7 +306,7 @@ pub fn scan(details: bool) -> Result<Vec<MonitorInfo>> {
                 None
             };
             let inputs = if details {
-                capability_inputs(p.handle)
+                super::cached_inputs(&p.id, || capability_inputs(p.handle).ok_or(())).ok()
             } else {
                 None
             };

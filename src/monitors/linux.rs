@@ -181,8 +181,11 @@ pub fn scan(details: bool) -> Result<Vec<MonitorInfo>> {
                         Ok(out) => info.current_input = parse_getvcp(&out),
                         Err(e) => info.error = Some(e.to_string()),
                     }
-                    match ddcutil(&["--bus", &bus, "capabilities"]) {
-                        Ok(out) => info.inputs = parse_input_caps(&out),
+                    let caps = super::cached_inputs(&info.id, || {
+                        ddcutil(&["--bus", &bus, "capabilities"]).map(|out| parse_input_caps(&out))
+                    });
+                    match caps {
+                        Ok(inputs) => info.inputs = inputs,
                         Err(e) => {
                             info.error.get_or_insert(e.to_string());
                         }

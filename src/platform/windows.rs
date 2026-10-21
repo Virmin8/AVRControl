@@ -2,8 +2,9 @@
 //! by a Win32 message loop on the main thread.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, bail};
 use global_hotkey::hotkey::HotKey;
@@ -15,7 +16,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{APP_NAME, Config};
+use crate::config::{APP_NAME, Action, Config};
 use crate::controller::{Event, Hooks};
 
 const WM_APP_RELOAD: u32 = WM_APP + 1;
@@ -28,11 +29,36 @@ const MENU_RECONNECT: &str = "__reconnect";
 const MENU_QUIT: &str = "__quit";
 const MENU_UPDATE: &str = "__update";
 
+/// The controller's event queue, for sleep and wake-up from the window procedure.
+static EVENTS: OnceLock<Sender<Event>> = OnceLock::new();
+/// Whether the tray icon's middle click mutes.
+static TRAY_VOLUME: AtomicBool = AtomicBool::new(true);
+
 unsafe extern "system" fn session_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // wParam: the session really is ending. Logging off leaves the receiver alone.
     if msg == WM_ENDSESSION && wp != 0 && (lp as u32 & ENDSESSION_LOGOFF) == 0 {
         crate::shutdown::power_off();
         return 0;
+    }
+    if msg == WM_POWERBROADCAST {
+        match wp as u32 {
+            // Windows allows about two seconds here before sleeping anyway.
+            PBT_APMSUSPEND => {
+                if let Some(tx) = EVENTS.get() {
+                    let (done, wait) = std::sync::mpsc::channel();
+                    if tx.send(Event::Sleep(done)).is_ok() {
+                        let _ = wait.recv_timeout(std::time::Duration::from_millis(1800));
+                    }
+                }
+            }
+            PBT_APMRESUMEAUTOMATIC => {
+                if let Some(tx) = EVENTS.get() {
+                    let _ = tx.send(Event::Resume);
+                }
+            }
+            _ => {}
+        }
+        return 1;
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
@@ -143,15 +169,23 @@ pub fn run(
         .with_menu_on_left_click(false)
         .build()?;
 
-    TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| {
-        if let TrayIconEvent::Click {
+    let _ = EVENTS.set(tx.clone());
+    TRAY_VOLUME.store(cfg.general.tray_volume, Ordering::Relaxed);
+    let tray_tx = tx.clone();
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| match e {
+        TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
             ..
-        } = e
-        {
-            crate::daemon::open_settings();
+        } => crate::daemon::open_settings(),
+        TrayIconEvent::Click {
+            button: MouseButton::Middle,
+            button_state: MouseButtonState::Up,
+            ..
+        } if TRAY_VOLUME.load(Ordering::Relaxed) => {
+            crate::controller::tray_action(&tray_tx, Action::MuteToggle)
         }
+        _ => {}
     }));
 
     let menu_tx = tx.clone();
@@ -232,7 +266,10 @@ pub fn run(
             if msg.hwnd.is_null() && msg.message == WM_APP_UPDATE {
                 if let Some(label) = pending_update.lock().unwrap().take() {
                     update_label = label;
-                    tray.set_menu(Some(Box::new(build_menu(&menu_cfg, update_label.as_deref()))));
+                    tray.set_menu(Some(Box::new(build_menu(
+                        &menu_cfg,
+                        update_label.as_deref(),
+                    ))));
                 }
                 continue;
             }
@@ -243,6 +280,7 @@ pub fn run(
                     registered = r;
                     *map.lock().unwrap() = m;
                     tray.set_menu(Some(Box::new(build_menu(&cfg, update_label.as_deref()))));
+                    TRAY_VOLUME.store(cfg.general.tray_volume, Ordering::Relaxed);
                     menu_cfg = cfg;
                 }
                 continue;

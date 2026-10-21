@@ -3,6 +3,38 @@
 All notable changes to AVR Control. Versions follow
 [semantic versioning](https://semver.org); each heading links to its release.
 
+## [Unreleased]
+
+### Added
+- **Live receiver status.** AVR Control now listens for the updates the
+  receiver sends when its front panel, remote or another app changes
+  something. The tray tooltip and the Status page follow along within a
+  second, and the volume overlay also shows when the volume is changed on the
+  receiver or its remote (Settings → General can turn that part off).
+- **Sleep and wake** (Settings → General): turn the receiver off when the PC
+  goes to sleep, if it's still on the startup input, and run the startup
+  action again on wake-up unless the receiver is in use on another input.
+- **Volume limit** (Settings → Receiver → Setup): the highest volume that
+  shortcuts, the tray icon and the settings window will set. The receiver's
+  own knob and remote aren't limited.
+- **Tray icon volume**: scroll on the tray icon to change the volume (Linux),
+  middle-click to mute (Linux and Windows). Can be turned off under General.
+- The audio keep-alive pauses while the receiver is in standby (on by
+  default, under General → Audio).
+
+### Changed
+- Reading the receiver's status is much quicker: all the questions go out
+  together instead of one after another, and the ones a receiver doesn't
+  answer no longer add 1.2 seconds each.
+- The settings window gets the status from the background service's live
+  copy instead of asking the receiver every few seconds.
+- Monitors' supported inputs are read once instead of on every refresh of
+  the Status page, and the tray tooltip reads the monitors' inputs every
+  five minutes and after a shortcut switches them, instead of after every
+  action.
+- The receiver's model comes from the settings when it's known, instead of
+  a network query; when a query fails, it isn't repeated every 30 seconds.
+
 ## [1.3.0] - 2026-10-15
 
 ### Added

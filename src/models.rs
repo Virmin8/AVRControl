@@ -90,4 +90,40 @@ mod tests {
         assert!(!t.contains_key("RES"));
         assert!(lookup("NOT-A-MODEL").is_none());
     }
+
+    #[test]
+    fn lookup_is_forgiving() {
+        assert!(lookup("").is_none());
+        assert!(lookup("  DTR-50.7 ").is_some());
+        // Regional suffixes fall back to the base model.
+        let base = lookup("DTR-50.7").unwrap();
+        assert!(std::ptr::eq(lookup("DTR-50.7E").unwrap(), base));
+    }
+
+    #[test]
+    fn every_table_is_usable() {
+        let f = file();
+        assert!(!f.models.is_empty());
+        for (model, &i) in &f.models {
+            let t = f
+                .tables
+                .get(i)
+                .unwrap_or_else(|| panic!("{model}: no table {i}"));
+            assert!(!t.is_empty(), "{model} has an empty table");
+        }
+    }
+
+    #[test]
+    fn ranges() {
+        let t: ModelTable = [(
+            "MVL".to_string(),
+            vec!["0..80".to_string(), "UP".to_string()],
+        )]
+        .into_iter()
+        .collect();
+        assert!(table_supports(&t, "MVL", "50"));
+        assert!(!table_supports(&t, "MVL", "51"));
+        assert!(table_supports(&t, "MVL", "up"));
+        assert!(!table_supports(&t, "AMT", "01"));
+    }
 }

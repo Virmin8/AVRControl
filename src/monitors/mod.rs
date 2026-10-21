@@ -153,6 +153,30 @@ pub fn carry_over(list: &mut [MonitorInfo], previous: &[MonitorInfo]) {
     }
 }
 
+/// Inputs each monitor advertised in its capabilities string. That never
+/// changes, and asking for it is the slowest DDC/CI request there is.
+static INPUT_CAPS: std::sync::Mutex<Option<std::collections::HashMap<MonitorId, Vec<u8>>>> =
+    std::sync::Mutex::new(None);
+
+/// The monitor's advertised inputs, read with `read` only the first time.
+fn cached_inputs<E>(
+    id: &MonitorId,
+    read: impl FnOnce() -> Result<Vec<u8>, E>,
+) -> Result<Vec<u8>, E> {
+    if let Some(inputs) = INPUT_CAPS.lock().unwrap().as_ref().and_then(|m| m.get(id)) {
+        return Ok(inputs.clone());
+    }
+    let inputs = read()?;
+    if !inputs.is_empty() {
+        INPUT_CAPS
+            .lock()
+            .unwrap()
+            .get_or_insert_default()
+            .insert(id.clone(), inputs.clone());
+    }
+    Ok(inputs)
+}
+
 /// (monitor, connector, current input) for each DDC/CI monitor.
 pub fn current_inputs() -> anyhow::Result<Vec<(MonitorId, String, Option<u8>)>> {
     backend::current_inputs()

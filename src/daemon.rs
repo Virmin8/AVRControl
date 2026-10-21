@@ -101,9 +101,12 @@ pub fn run() -> Result<()> {
     crate::audio::apply(&cfg.audio);
     crate::update::clean_stale_download();
     let update_tx = tx.clone();
+    let controller_tx = tx.clone();
+    #[cfg(target_os = "linux")]
+    crate::shutdown::watch_sleep(tx.clone());
     let result = platform::run(cfg, tx, move |cfg, hooks| {
         crate::update::spawn(update_tx, hooks.on_update.clone());
-        thread::spawn(move || Controller::new(cfg, hooks).run(rx));
+        thread::spawn(move || Controller::new(cfg, hooks, controller_tx).run(rx));
     });
     ipc::cleanup();
     crate::update::restart_if_updated();

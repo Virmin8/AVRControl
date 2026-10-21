@@ -1,0 +1,40 @@
+# Written by AVR Control 1.0.0. Keep as is: config.rs checks it still loads.
+[receiver]
+host = "192.168.1.50"
+port = 60128
+max_volume = 80
+volume_half_steps = false
+
+[receiver.input_names]
+05 = "Desktop"
+
+[general]
+startup_shortcut = "pc"
+notifications = true
+volume_osd = true
+
+[[shortcuts]]
+id = "pc"
+name = "Source: PC"
+hotkey = "Ctrl+Shift+Alt+F1"
+
+[shortcuts.action]
+type = "switch"
+receiver_input = "05"
+power_on = true
+extra_commands = ["HAO00"]
+
+[[shortcuts.action.monitors]]
+input = 15
+
+[shortcuts.action.monitors.monitor]
+mfg = "DEL"
+model = "DELL S3220DGF"
+
+[[shortcuts]]
+id = "volume_up"
+name = "Volume up"
+hotkey = "Ctrl+Shift+Alt+Up"
+
+[shortcuts.action]
+type = "volume_up"

@@ -12,7 +12,7 @@ use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, GlobalShortcuts, Ne
 use ksni::TrayMethods;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::config::{APP_ID, APP_NAME, Config};
+use crate::config::{APP_ID, APP_NAME, Action, Config};
 use crate::controller::{Event, Hooks};
 use crate::hotkey::Hotkey;
 
@@ -41,6 +41,8 @@ struct Tray {
     status: String,
     /// Label of the update entry, when a release is available.
     update: Option<String>,
+    /// Scroll for volume, middle-click to mute.
+    volume: bool,
 }
 
 impl ksni::Tray for Tray {
@@ -75,6 +77,24 @@ impl ksni::Tray for Tray {
 
     fn activate(&mut self, _x: i32, _y: i32) {
         crate::daemon::open_settings();
+    }
+
+    fn secondary_activate(&mut self, _x: i32, _y: i32) {
+        if self.volume {
+            crate::controller::tray_action(&self.tx, Action::MuteToggle);
+        }
+    }
+
+    fn scroll(&mut self, delta: i32, orientation: ksni::Orientation) {
+        if !self.volume || delta == 0 || orientation != ksni::Orientation::Vertical {
+            return;
+        }
+        let action = if delta > 0 {
+            Action::VolumeUp
+        } else {
+            Action::VolumeDown
+        };
+        crate::controller::tray_action(&self.tx, action);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -309,6 +329,7 @@ pub fn run(
             shortcuts: menu_entries(&cfg),
             status: String::new(),
             update: None,
+            volume: cfg.general.tray_volume,
         };
         let tray = match tray.spawn().await {
             Ok(h) => Some(h),
@@ -334,7 +355,12 @@ pub fn run(
                     }
                     if let Some(t) = &tray {
                         let entries = menu_entries(&cfg);
-                        t.update(move |t| t.shortcuts = entries).await;
+                        let volume = cfg.general.tray_volume;
+                        t.update(move |t| {
+                            t.shortcuts = entries;
+                            t.volume = volume;
+                        })
+                        .await;
                     }
                     let _ = portal_tx.send(PortalMsg::Bind(cfg));
                 }

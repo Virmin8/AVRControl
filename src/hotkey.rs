@@ -213,6 +213,30 @@ mod tests {
     }
 
     #[test]
+    fn every_key_round_trips() {
+        let mut names: Vec<String> = KEYS.iter().map(|(c, _, _)| c.to_string()).collect();
+        names.extend((1..=24).map(|n| format!("F{n}")));
+        names.extend((0..=9).map(|n| format!("Num{n}")));
+        names.extend(('A'..='Z').map(String::from));
+        names.extend(('0'..='9').map(String::from));
+        for name in names {
+            let text = format!("Ctrl+Alt+{name}");
+            let h = Hotkey::parse(&text).unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(h.to_string(), text);
+            assert_eq!(Hotkey::parse(&h.to_string()), Some(h));
+        }
+        // Aliases land on the canonical name.
+        assert_eq!(
+            Hotkey::parse("Win+PgUp").unwrap().to_string(),
+            "Super+PageUp"
+        );
+        assert_eq!(
+            Hotkey::parse("ctrl+esc").unwrap().to_string(),
+            "Ctrl+Escape"
+        );
+    }
+
+    #[test]
     fn validation() {
         assert!(validate("").is_ok());
         assert!(validate("A").is_err());
