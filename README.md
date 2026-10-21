@@ -238,7 +238,15 @@ order, e.g. `avrcontrol list | more`.
 
 Volume changes show a small overlay in the same front-panel style as the
 settings window, on Linux and Windows alike. On Wayland the desktop decides
-where it appears.
+where it appears. On Linux clicks pass through it; on Windows it takes clicks
+on its own small area for the two seconds it's up.
+
+Some receivers step the volume by halves but only report the whole number
+(49.5 comes back as 49). For those, the overlay works out the half from the
+replies to volume up/down shortcuts and shows e.g. 49.5. After a change on
+the receiver's knob or remote it shows the whole number until the next
+shortcut step. Receivers that report half steps themselves are set up with
+**Volume steps: Half** under Receiver → Setup instead.
 
 ## Receiver model table
 

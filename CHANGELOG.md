@@ -5,7 +5,19 @@ All notable changes to AVR Control. Versions follow
 
 ## [Unreleased]
 
+### Fixed
+- **Windows: the volume overlay was empty.** Only its outline appeared, with
+  nothing drawn inside, since 1.2.0. The click-through that hid the drawing
+  is now Linux-only.
+- Holding a volume key repeats about a third faster: each repeat goes out as
+  soon as the receiver has answered the last one, instead of skipping a beat
+  when it hadn't yet.
+- Windows: the first held volume key after starting now repeats too.
+
 ### Added
+- **Half steps in the volume overlay** for receivers that step by halves but
+  report whole numbers (e.g. DTR-50.7): volume up/down shortcuts now show
+  49.5 instead of 49 twice.
 - **Live receiver status.** AVR Control now listens for the updates the
   receiver sends when its front panel, remote or another app changes
   something. The tray tooltip and the Status page follow along within a
